@@ -1,0 +1,19 @@
+{"type":"queue-operation","operation":"enqueue","timestamp":"2026-07-01T10:00:00.000Z","sessionId":"s1","content":"first prompt"}
+{"type":"queue-operation","operation":"dequeue","timestamp":"2026-07-01T10:00:00.100Z","sessionId":"s1"}
+{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"first prompt"},"uuid":"u1","timestamp":"2026-07-01T10:00:01.000Z","origin":{"kind":"human"},"sessionId":"s1"}
+{"parentUuid":"u1","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"}]},"uuid":"a1","timestamp":"2026-07-01T10:00:02.000Z","sessionId":"s1"}
+{"parentUuid":"a1","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"uuid":"a2","timestamp":"2026-07-01T10:00:03.000Z","sessionId":"s1"}
+{"parentUuid":"a2","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"file.txt"}]},"uuid":"u2","timestamp":"2026-07-01T10:00:04.000Z","sessionId":"s1"}
+{"parentUuid":"u2","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done with turn one — ünïcode ✓"}]},"uuid":"a3","timestamp":"2026-07-01T10:00:05.000Z","sessionId":"s1"}
+{"type":"last-prompt","lastPrompt":"first prompt","leafUuid":"a3","sessionId":"s1"}
+{"type":"ai-title","aiTitle":"Sample session","sessionId":"s1"}
+{"parentUuid":"a3","isSidechain":false,"type":"user","message":{"role":"user","content":"second prompt"},"uuid":"u3","timestamp":"2026-07-01T10:01:00.000Z","origin":{"kind":"human"},"sessionId":"s1"}
+{"parentUuid":"u3","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Agent","input":{"prompt":"explore"}}]},"uuid":"a4","timestamp":"2026-07-01T10:01:01.000Z","sessionId":"s1"}
+{"parentUuid":null,"isSidechain":true,"type":"user","message":{"role":"user","content":"explore"},"uuid":"sc1","timestamp":"2026-07-01T10:01:02.000Z","sessionId":"s1"}
+{"parentUuid":"sc1","isSidechain":true,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"sidechain answer"}]},"uuid":"sc2","timestamp":"2026-07-01T10:01:03.000Z","sessionId":"s1"}
+{"parentUuid":"a4","isSidechain":false,"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"agent result"}]},"uuid":"u4","timestamp":"2026-07-01T10:01:04.000Z","sessionId":"s1"}
+{"parentUuid":"u4","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"turn two answer"}]},"uuid":"a5","timestamp":"2026-07-01T10:01:05.000Z","sessionId":"s1"}
+{"type":"last-prompt","lastPrompt":"second prompt","leafUuid":"a5","sessionId":"s1"}
+{"parentUuid":"a5","isSidechain":false,"type":"user","message":{"role":"user","content":"third prompt"},"uuid":"u5","timestamp":"2026-07-01T10:02:00.000Z","origin":{"kind":"human"},"sessionId":"s1"}
+{"parentUuid":"u5","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"turn three answer"}]},"uuid":"a6","timestamp":"2026-07-01T10:02:01.000Z","sessionId":"s1"}
+{"type":"last-prompt","lastPrompt":"third prompt","leafUuid":"a6","sessionId":"s1"}

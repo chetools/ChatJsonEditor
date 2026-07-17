@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ChatJsonEditor — Claude Code sessions</title>
+<script>
+  window.MathJax = {
+    tex: {
+      inlineMath: [['$', '$'], ['\\(', '\\)']],
+      displayMath: [['$$', '$$'], ['\\[', '\\]']],
+    },
+    svg: { fontCache: 'global' },
+    startup: { typeset: false },
+  };
+</script>
+<script src="/static/vendor/tex-svg.js" id="MathJax-script"></script>
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+<style>
+  :root {
+    --bg: #1f1e1b; --sidebar: #262521; --sidebar2: #2d2b27; --panel: #1f1e1b;
+    --card: #2a2926; --border: #3a3833; --border2: #46443e;
+    --text: #ece9e3; --text2: #c8c4bb; --dim: #8f8b81; --faint: #6b675e;
+    --accent: #c96442; --accent-soft: #d97a58; --danger: #d9534f;
+    --ok: #6fce8f; --user-bg: #34322d; --cur: #d97a58;
+    --mono: "Cascadia Code", ui-monospace, "SF Mono", Consolas, monospace;
+    --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; font: 15px/1.6 var(--sans); background: var(--bg); color: var(--text); overflow: hidden; }
+  button { font-family: inherit; }
+
+  #app { display: flex; height: 100vh; }
+  .pane { display: flex; flex-direction: column; min-width: 0; height: 100%; }
+  #explorerPane { width: 340px; background: var(--sidebar); border-right: 1px solid var(--border); flex: none; }
+  #conversationPane { flex: 1; background: var(--panel); }
+  .splitter { width: 6px; flex: none; cursor: col-resize; position: relative; }
+  .splitter::after { content: ""; position: absolute; inset: 0 2px; background: var(--border); opacity: 0; transition: opacity .15s; }
+  .splitter:hover::after, .splitter.dragging::after { opacity: 1; }
+
+  .pane-head { padding: 13px 14px 9px; font-size: 12px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); font-weight: 600; flex: none; display: flex; align-items: center; gap: 8px; }
+  .pane-head .grow { flex: 1; }
+  .icon-btn { background: none; border: 1px solid transparent; color: var(--dim); cursor: pointer; font-size: 13px; border-radius: 6px; padding: 3px 7px; text-transform: none; letter-spacing: 0; }
+  .icon-btn:hover { border-color: var(--border2); color: var(--text); }
+
+  /* ---- explorer tree ---- */
+  #tree { overflow-y: auto; flex: 1; padding: 4px 6px 20px; }
+  .node { user-select: none; }
+  .row { display: flex; align-items: center; gap: 5px; padding: 4px 6px; border-radius: 6px; cursor: pointer; white-space: nowrap; font-size: 13.5px; }
+  .row:hover { background: rgba(255,255,255,.045); }
+  .row.active { background: rgba(201,100,66,.16); }
+  .row .disc { width: 14px; flex: none; text-align: center; color: var(--faint); font-size: 10px; transition: transform .12s; }
+  .row.open > .disc { transform: rotate(90deg); }
+  .row .ico { flex: none; opacity: .85; }
+  .row .lbl { overflow: hidden; text-overflow: ellipsis; }
+  .row.folder .lbl { color: var(--text2); }
+  .row.project .lbl { color: var(--text); font-weight: 550; }
+  .row.session { color: var(--text2); }
+  .row.session .sub { color: var(--faint); font-size: 11.5px; margin-left: 6px; }
+  .children { overflow: hidden; }
+  .placeholder { color: var(--faint); padding: 20px 12px; font-size: 13px; }
+  .loading { color: var(--faint); font-size: 12px; padding: 4px 6px; }
+
+  /* ---- conversation ---- */
+  #toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 18px; border-bottom: 1px solid var(--border); flex: none; flex-wrap: wrap; }
+  #toolbar .ct { font-weight: 600; margin-right: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #toolbar .sel { color: var(--dim); font-size: 13px; }
+  .btn { background: var(--card); color: var(--text2); border: 1px solid var(--border2); border-radius: 7px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .btn:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+  .btn:disabled { opacity: .38; cursor: default; }
+  .btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn.danger { color: #f0a9a6; border-color: #6a3b39; }
+  .btn.danger:hover:not(:disabled) { border-color: var(--danger); color: #fff; }
+
+  #banner { display: none; padding: 9px 18px; background: #3a2f18; color: #f2d9a0; border-bottom: 1px solid #5a4a24; font-size: 13px; flex: none; }
+  #banner button { margin-left: 10px; }
+
+  #transcript { overflow-y: auto; flex: 1; padding: 24px 0 90px; scroll-behavior: smooth; }
+  #transcript .inner { max-width: 780px; margin: 0 auto; padding: 0 28px; }
+  .conv-empty { color: var(--faint); text-align: center; padding: 80px 20px; }
+
+  .turn { margin-bottom: 4px; border-radius: 12px; padding: 2px 8px 6px; border: 1px solid transparent; cursor: pointer; }
+  .turn.selected { background: rgba(217,83,79,.09); border-color: rgba(217,83,79,.42); }
+  .turn.current { box-shadow: 0 0 0 2px var(--cur) inset; }
+  .turn-head { display: flex; align-items: center; gap: 9px; padding: 5px 4px; color: var(--faint); font-size: 12px; }
+  .turn-head .box { width: 14px; height: 14px; border: 1.5px solid var(--border2); border-radius: 4px; flex: none; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; color: #fff; }
+  .turn.selected .turn-head .box { background: var(--danger); border-color: var(--danger); }
+  .turn-head .idx { font-family: var(--mono); color: var(--dim); }
+  .turn-head .spacer { flex: 1; }
+
+  .msg { margin: 12px 0; }
+  .msg.user { display: flex; justify-content: flex-end; }
+  .msg.user .bubble { background: var(--user-bg); border: 1px solid var(--border); border-radius: 14px; padding: 10px 16px; max-width: 90%; }
+  .rich { overflow-wrap: break-word; word-break: break-word; }
+  .rich > *:first-child { margin-top: 0; } .rich > *:last-child { margin-bottom: 0; }
+  .rich p { margin: 0 0 12px; }
+  .rich h1,.rich h2,.rich h3,.rich h4 { line-height: 1.3; margin: 20px 0 10px; font-weight: 620; }
+  .rich h1 { font-size: 1.5em; } .rich h2 { font-size: 1.3em; } .rich h3 { font-size: 1.12em; }
+  .rich ul,.rich ol { margin: 0 0 12px; padding-left: 1.5em; }
+  .rich li { margin: 3px 0; }
+  .rich a { color: var(--accent-soft); }
+  .rich blockquote { border-left: 3px solid var(--border2); margin: 0 0 12px; padding: 2px 0 2px 14px; color: var(--text2); }
+  .rich code { font-family: var(--mono); font-size: .88em; background: rgba(255,255,255,.07); padding: .12em .35em; border-radius: 5px; }
+  .rich pre { background: #171614; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; overflow-x: auto; margin: 0 0 12px; }
+  .rich pre code { background: none; padding: 0; font-size: .85em; line-height: 1.5; }
+  .rich table { border-collapse: collapse; margin: 0 0 12px; display: block; overflow-x: auto; }
+  .rich th, .rich td { border: 1px solid var(--border2); padding: 6px 10px; text-align: left; }
+  .rich th { background: rgba(255,255,255,.04); }
+  .rich img { max-width: 100%; }
+  mjx-container[display="true"] { overflow-x: auto; overflow-y: hidden; }
+
+  details.block { border: 1px solid var(--border); border-radius: 10px; margin: 10px 0; background: var(--card); overflow: hidden; }
+  details.block > summary { cursor: pointer; padding: 8px 12px; font-size: 13px; color: var(--text2); list-style: none; display: flex; align-items: center; gap: 8px; user-select: none; }
+  details.block > summary::-webkit-details-marker { display: none; }
+  details.block > summary .chev { transition: transform .15s; color: var(--faint); font-size: 11px; }
+  details.block[open] > summary .chev { transform: rotate(90deg); }
+  details.block > summary .tag { font-family: var(--mono); font-size: 12px; }
+  details.block > summary .err { color: #f0a9a6; font-size: 11px; border: 1px solid #6a3b39; border-radius: 20px; padding: 0 7px; }
+  details.block > summary .name { color: var(--accent-soft); font-weight: 600; }
+  details.block .body { padding: 0 12px 12px; border-top: 1px solid var(--border); }
+  details.block.thinking { background: transparent; }
+  details.block.thinking .body .rich { color: var(--text2); font-style: italic; }
+  .io-label { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); margin: 12px 0 5px; }
+  pre.io { font-family: var(--mono); font-size: 12px; line-height: 1.5; background: #171614; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 0; overflow: auto; max-height: 420px; white-space: pre-wrap; word-break: break-word; }
+
+  /* ---- summary / outline pane ---- */
+  #summaryPane { width: 300px; background: var(--sidebar); border-left: 1px solid var(--border); flex: none; }
+  #summaryPane .pane-head { border-bottom: 1px solid var(--border); }
+  .sumctl { font-size: 11px; text-transform: none; letter-spacing: 0; color: var(--dim); display: flex; align-items: center; gap: 5px; }
+  .sumctl input { width: 44px; background: var(--card); color: var(--text); border: 1px solid var(--border2); border-radius: 5px; padding: 2px 5px; font: inherit; font-size: 12px; }
+  #sumList { overflow-y: auto; flex: 1; padding: 2px 0 40px; }
+  #sumList .placeholder { padding: 20px 12px; }
+  .sumitem { padding: 8px 12px 9px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .sumitem:hover { background: rgba(255,255,255,.04); }
+  .sumitem.current { background: rgba(217,122,88,.13); box-shadow: inset 3px 0 0 var(--cur); }
+  .sumitem .sh { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--faint); margin-bottom: 4px; }
+  .sumitem .sh .idx { font-family: var(--mono); color: var(--dim); }
+  .sumitem .sh .mark { width: 8px; height: 8px; border-radius: 3px; border: 1.5px solid var(--border2); flex: none; }
+  .sumitem.selected .sh .mark { background: var(--danger); border-color: var(--danger); }
+  .sumitem .u { color: var(--text2); font-size: 12.5px; line-height: 1.45; }
+  .sumitem .a { color: var(--dim); font-size: 12px; line-height: 1.45; margin-top: 5px; padding-top: 5px; border-top: 1px dashed var(--border); }
+  .sumitem .muted { color: var(--faint); font-style: italic; }
+  .clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: var(--sumLines, 2); line-clamp: var(--sumLines, 2); overflow: hidden; white-space: pre-wrap; word-break: break-word; }
+
+  /* modal + toast + popover */
+  .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); align-items: center; justify-content: center; z-index: 30; }
+  .overlay.show { display: flex; }
+  .sheet { background: var(--sidebar2); border: 1px solid var(--border2); border-radius: 12px; padding: 22px; width: min(520px, 92vw); max-height: 84vh; overflow-y: auto; }
+  .sheet h2 { margin: 0 0 8px; font-size: 16px; }
+  .sheet p { color: var(--text2); font-size: 14px; }
+  .sheet .row-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
+  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--sidebar2); border: 1px solid var(--border2); border-radius: 9px; padding: 10px 16px; font-size: 13px; display: none; z-index: 40; }
+
+  /* keybindings table */
+  table.keys { width: 100%; border-collapse: collapse; margin: 6px 0 4px; }
+  table.keys td { padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 13.5px; }
+  table.keys td.act { color: var(--text2); }
+  table.keys td.combo { text-align: right; }
+  .kbd { font-family: var(--mono); font-size: 12px; background: var(--card); border: 1px solid var(--border2); border-radius: 6px; padding: 3px 8px; cursor: pointer; color: var(--text); }
+  .kbd.capturing { border-color: var(--accent); color: var(--accent-soft); }
+  .infonote { font-size: 12.5px; color: var(--text2); background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="pane" id="explorerPane">
+    <div class="pane-head">
+      <span class="grow">Explorer</span>
+      <button class="icon-btn" id="collapseAll" title="Collapse all">⊟</button>
+      <button class="icon-btn" id="helpBtn" title="Shortcuts &amp; settings (?)">⌨</button>
+    </div>
+    <div id="tree"><div class="placeholder">Loading…</div></div>
+  </div>
+  <div class="splitter" data-target="explorerPane"></div>
+
+  <div class="pane" id="conversationPane">
+    <div id="banner">The session file changed on disk — it may be open in Claude Code.<button class="btn" onclick="reloadSession()">Reload</button></div>
+    <div id="toolbar" style="display:none">
+      <span class="ct" id="convTitle"></span>
+      <span class="sel" id="selInfo"></span>
+      <button class="btn" id="infoBtn" title="How edits reach Claude">ⓘ</button>
+      <button class="btn" id="showAllBtn" title="Reading view shows only prompts &amp; replies. Show all reveals thinking, tools, and command/notification entries (and splits them into their own turns).">Show all</button>
+      <button class="btn" id="delBtn" disabled>Delete</button>
+      <button class="btn" id="undoBtn" disabled>↶ Undo</button>
+      <button class="btn" id="redoBtn" disabled>↷ Redo</button>
+    </div>
+    <div id="transcript"><div class="conv-empty">Pick a session in the Explorer to view the conversation.</div></div>
+  </div>
+
+  <div class="splitter" data-target="summaryPane" data-side="right"></div>
+  <div class="pane" id="summaryPane">
+    <div class="pane-head">
+      <span class="grow">Summary</span>
+      <label class="sumctl" title="Lines of user text / reply to show per turn">lines <input type="number" id="sumLines" min="1" max="12" value="2"></label>
+    </div>
+    <div id="sumList"><div class="placeholder">Open a session to see its outline.</div></div>
+  </div>
+</div>
+
+<!-- delete confirm -->
+<div class="overlay" id="modalWrap">
+  <div class="sheet" style="width:min(440px,90vw)">
+    <h2>Delete turns?</h2>
+    <p id="modalText"></p>
+    <p style="font-size:12.5px;color:var(--dim)">A snapshot is saved first — you can always undo.</p>
+    <div class="row-actions">
+      <button class="btn" onclick="hideModal()">Cancel</button>
+      <button class="btn danger" id="modalConfirm">Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- shortcuts / settings -->
+<div class="overlay" id="keysWrap">
+  <div class="sheet">
+    <h2>Keyboard shortcuts</h2>
+    <p style="font-size:12.5px">Click a key to rebind it, then press the new combination. Saved to <code>keybindings.json</code>.</p>
+    <table class="keys"><tbody id="keysBody"></tbody></table>
+    <div class="row-actions">
+      <button class="btn" id="keysReset">Reset defaults</button>
+      <button class="btn" onclick="hideKeys()">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- info: how edits reach Claude -->
+<div class="overlay" id="infoWrap">
+  <div class="sheet" style="width:min(500px,92vw)">
+    <h2>How edits reach Claude</h2>
+    <div class="infonote">
+      Edits are written to the session's <code>.jsonl</code> immediately, but Claude Desktop does not
+      watch the file — an open conversation keeps its in-memory copy.
+      <ul style="margin:10px 0 0;padding-left:18px">
+        <li><b>Best:</b> edit a session that isn't currently open, then open/resume it in Claude.</li>
+        <li>If it's already open, quit and reopen Claude Desktop (the session list re-reads from disk on launch).</li>
+        <li>CLI <code>claude --resume &lt;id&gt;</code> always reads the file fresh.</li>
+      </ul>
+      <p style="margin:10px 0 0;color:var(--dim)">If a session is being written by Claude while you edit, the save is blocked (409) and you'll see a reload banner.</p>
+    </div>
+    <div class="row-actions"><button class="btn" onclick="hideInfo()">Got it</button></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const state = {
+  slug: null, sid: null, title: null, session: null,
+  selected: new Set(), lastClicked: null, current: -1,
+  keys: {}, expanded: new Set(JSON.parse(localStorage.getItem('cje.expanded') || '[]')),
+  showAll: localStorage.getItem('cje.showAll') === '1',
+};
+
+const fmtBytes = (n) => n > 1048576 ? (n/1048576).toFixed(1)+' MB' : n > 1024 ? (n/1024).toFixed(1)+' KB' : n+' B';
+const fmtTime = (t) => t ? new Date(t).toLocaleString([], {dateStyle:'short', timeStyle:'short'}) : '';
+const esc = (s) => (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function toast(msg, ok=true) {
+  const t = $('#toast'); t.textContent = msg; t.style.display = 'block';
+  t.style.borderColor = ok ? 'var(--ok)' : 'var(--danger)';
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', 3200);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (r.status === 409) { $('#banner').style.display = 'block'; throw new Error('conflict'); }
+  if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || r.statusText); }
+  return r.json();
+}
+
+/* ---------- rich rendering ---------- */
+marked.setOptions({ gfm: true, breaks: false });
+function renderRich(text, el) {
+  const math = [];
+  const stash = (m) => ` MATH${math.push(m) - 1} `;
+  let s = text.replace(/\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]/g, stash)
+              .replace(/\\\([\s\S]+?\\\)/g, stash)
+              .replace(/(?<!\\)\$(?!\s)(?:\\.|[^$\\])+?(?<!\s)\$/g, stash);
+  let html = marked.parse(s);
+  html = html.replace(/ MATH(\d+) /g, (_, i) => esc(math[+i]));
+  el.innerHTML = DOMPurify.sanitize(html);
+  if (math.length && window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([el]).catch(() => {});
+}
+
+/* ---------- explorer tree ---------- */
+// Build a compacted directory trie from project paths; sessions are lazy leaves.
+function buildTree(projects) {
+  const root = { name: '', children: new Map(), project: null };
+  for (const p of projects) {
+    const segs = p.label.split(/[\/\\]/).filter(Boolean);
+    let node = root;
+    for (const seg of segs) {
+      if (!node.children.has(seg)) node.children.set(seg, { name: seg, children: new Map(), project: null });
+      node = node.children.get(seg);
+    }
+    node.project = p; // this path node is backed by a real project slug
+  }
+  return root;
+}
+function pathKey(segs) { return segs.join('/'); }
+
+function renderTree(root) {
+  const container = $('#tree'); container.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  // skip the empty root; render its children, compacting single-child folder chains
+  for (const child of root.children.values()) renderNode(child, [], frag, 0);
+  if (!root.children.size) frag.appendChild(Object.assign(document.createElement('div'), {className:'placeholder', textContent:'No projects found'}));
+  container.appendChild(frag);
+}
+function renderNode(node, prefix, parent, depth) {
+  // compact single-child folder chains (VS Code style)
+  let label = node.name, cur = node, segs = [...prefix, node.name];
+  while (!cur.project && cur.children.size === 1) {
+    const only = [...cur.children.values()][0];
+    label += '/' + only.name; segs.push(only.name); cur = only;
+  }
+  const node2 = cur;
+  const key = pathKey(segs);
+  const isProject = !!node2.project;
+  const hasChildren = node2.children.size > 0;
+  const wrap = document.createElement('div'); wrap.className = 'node';
+  const row = document.createElement('div');
+  row.className = 'row ' + (isProject ? 'project' : 'folder');
+  const open = state.expanded.has(key);
+  if (open) row.classList.add('open');
+  const disc = (hasChildren || isProject) ? '▶' : '';
+  row.innerHTML = `<span class="disc">${disc}</span><span class="ico">${isProject ? '💬' : '📁'}</span><span class="lbl" title="${esc(segs.join('/'))}">${esc(label)}</span>`;
+  wrap.appendChild(row);
+  const kids = document.createElement('div'); kids.className = 'children';
+  kids.style.paddingLeft = '13px';
+  kids.style.display = open ? 'block' : 'none';
+  wrap.appendChild(kids);
+  parent.appendChild(wrap);
+
+  let sessionsLoaded = false;
+  async function loadProjectSessions() {
+    if (sessionsLoaded) return;
+    sessionsLoaded = true;
+    const ph = document.createElement('div'); ph.className = 'loading'; ph.textContent = 'loading sessions…';
+    kids.appendChild(ph);
+    try {
+      const sessions = await api(`/api/projects/${node2.project.slug}/sessions`);
+      ph.remove();
+      if (!sessions.length) { const e = document.createElement('div'); e.className = 'loading'; e.textContent = 'no sessions'; kids.appendChild(e); }
+      for (const sdata of sessions) kids.appendChild(renderSession(node2.project.slug, sdata));
+    } catch (e) { ph.textContent = 'error: ' + e.message; }
+  }
+  function setOpen(nowOpen) {
+    if (nowOpen) state.expanded.add(key); else state.expanded.delete(key);
+    localStorage.setItem('cje.expanded', JSON.stringify([...state.expanded]));
+    row.classList.toggle('open', nowOpen);
+    kids.style.display = nowOpen ? 'block' : 'none';
+    if (nowOpen && isProject) loadProjectSessions();
+  }
+  row.onclick = () => setOpen(!state.expanded.has(key));
+  // folder children render eagerly (cheap); project sessions load lazily on open
+  if (node2.children.size) for (const c of node2.children.values()) renderNode(c, segs, kids, depth + 1);
+  if (isProject && open) loadProjectSessions();
+}
+function renderSession(slug, s) {
+  const row = document.createElement('div');
+  row.className = 'row session'; row.dataset.sid = s.sid;
+  row.innerHTML = `<span class="disc"></span><span class="ico">📄</span><span class="lbl">${esc(s.title)}<span class="sub">${s.turnCount}t · ${fmtBytes(s.bytes)}</span></span>`;
+  row.onclick = (e) => { e.stopPropagation(); markActiveSession(row); openSession(slug, s.sid, s.title); };
+  return row;
+}
+function markActiveSession(row) {
+  document.querySelectorAll('#tree .row.session.active').forEach(x => x.classList.remove('active'));
+  row.classList.add('active');
+}
+$('#collapseAll').onclick = () => { state.expanded.clear(); localStorage.setItem('cje.expanded', '[]'); renderTree(treeRoot); };
+
+let treeRoot = null;
+async function loadTree() {
+  const projects = await api('/api/projects');
+  treeRoot = buildTree(projects);
+  renderTree(treeRoot);
+}
+
+/* ---------- session loading ---------- */
+function sessionUrl(slug, sid) { return `/api/sessions/${slug}/${sid}${state.showAll ? '?showAll=1' : ''}`; }
+async function openSession(slug, sid, title) {
+  state.slug = slug; state.sid = sid; state.title = title;
+  state.selected = new Set(); state.lastClicked = null; state.current = -1;
+  refreshSession(await api(sessionUrl(slug, sid)));
+}
+async function reloadSession() {
+  $('#banner').style.display = 'none';
+  if (state.slug && state.sid) refreshSession(await api(sessionUrl(state.slug, state.sid)));
+}
+function refreshSession(sess) {
+  state.session = sess;
+  state.selected = new Set([...state.selected].filter(id => sess.turns.some(t => t.id === id)));
+  $('#banner').style.display = 'none';
+  $('#toolbar').style.display = 'flex';
+  $('#convTitle').textContent = `${state.title || state.sid} · ${fmtBytes(sess.bytes)}`;
+  renderTranscript();
+  renderSummary();
+}
+
+/* ---------- transcript ---------- */
+function deletableTurns() { return state.session ? state.session.turns.filter(t => t.deletable) : []; }
+
+// A "reading view" message is real conversation: an assistant reply, a
+// human-typed prompt (not synthetic), or an unparseable raw line (surfaced so
+// anomalies aren't silently hidden). Thinking/tools/system are machinery.
+function isReadingMsg(m) {
+  return m.kind === 'assistant' || (m.kind === 'user' && !m.synthetic) || m.kind === 'raw';
+}
+function renderTranscript() {
+  const wrap = $('#transcript'); wrap.innerHTML = '';
+  const inner = document.createElement('div'); inner.className = 'inner'; wrap.appendChild(inner);
+  const sess = state.session;
+  if (!deletableTurns().length) { inner.innerHTML = '<div class="conv-empty">No turns in this session.</div>'; updateToolbar(); return; }
+
+  let visIdx = 0;
+  for (const t of sess.turns) {
+    const allMsgs = t.messages || [];
+    // Reading view: only actual conversation (human prompts + assistant replies).
+    // Show all: everything — thinking, tools, system, and synthetic entries.
+    const msgs = state.showAll ? allMsgs : allMsgs.filter(isReadingMsg);
+    if (!t.deletable && !msgs.length) continue;
+    const turnEl = document.createElement('div');
+    turnEl.className = 'turn' + (state.selected.has(t.id) ? ' selected' : '');
+    turnEl.dataset.turnId = t.id;
+
+    const head = document.createElement('div'); head.className = 'turn-head';
+    if (t.deletable) {
+      const idx = ++visIdx; turnEl.dataset.vis = idx - 1;
+      head.innerHTML = `<span class="box">${state.selected.has(t.id) ? '✓' : ''}</span><span class="idx">#${idx}</span><span>${fmtTime(t.timestamp)}</span><span class="spacer"></span><span>${t.toolCount} tools · ${fmtBytes(t.bytes)}</span>`;
+    } else {
+      head.innerHTML = '<span class="idx">header</span>';
+    }
+    turnEl.appendChild(head);
+
+    const resultById = {};
+    for (const m of msgs) if (m.kind === 'tool_result' && m.toolUseId) resultById[m.toolUseId] = m;
+    const consumed = new Set();
+    for (const m of msgs) {
+      if (m.kind === 'tool_result' && consumed.has(m)) continue;
+      if (m.kind === 'tool_use') { const res = m.id ? resultById[m.id] : null; if (res) consumed.add(res); turnEl.appendChild(renderToolBlock(m, res)); }
+      else if (m.kind === 'tool_result') turnEl.appendChild(renderToolBlock(null, m));
+      else if (m.kind === 'thinking') turnEl.appendChild(renderThinking(m));
+      else if (m.kind === 'user') turnEl.appendChild(renderUser(m));
+      else if (m.kind === 'assistant') turnEl.appendChild(renderAssistant(m));
+      else if (m.kind === 'raw') turnEl.appendChild(renderRaw(m));
+    }
+
+    if (t.deletable) {
+      turnEl.addEventListener('click', (e) => {
+        if (e.target.closest('summary, a, pre, .io, details')) return;   // interactive/readable
+        if (String(window.getSelection())) return;                       // user is selecting text
+        setCurrent(+turnEl.dataset.vis);
+        toggleSelect(t.id, e.shiftKey);
+      });
+    }
+    inner.appendChild(turnEl);
+  }
+  // re-apply the current-turn ring (e.g. after a noise-toggle re-render)
+  const els = turnEls();
+  if (state.current >= 0 && els[state.current]) els[state.current].classList.add('current');
+  updateToolbar();
+}
+
+function renderUser(m) { const d=document.createElement('div'); d.className='msg user' + (m.synthetic ? ' synthetic' : ''); const b=document.createElement('div'); b.className='bubble rich'; renderRich(m.text,b); d.appendChild(b); return d; }
+function renderAssistant(m) { const d=document.createElement('div'); d.className='msg assistant'; const r=document.createElement('div'); r.className='rich'; renderRich(m.text,r); d.appendChild(r); return d; }
+function renderThinking(m) {
+  const det=document.createElement('details'); det.className='block thinking';
+  det.innerHTML = `<summary><span class="chev">▶</span><span class="tag">💭 thinking</span></summary>`;
+  const body=document.createElement('div'); body.className='body'; const r=document.createElement('div'); r.className='rich';
+  det.addEventListener('toggle', () => { if (det.open && !r.dataset.done) { renderRich(m.text, r); r.dataset.done='1'; } });
+  body.appendChild(r); det.appendChild(body); return det;
+}
+function renderToolBlock(use, res) {
+  const det=document.createElement('details'); det.className='block tool';
+  const name = use ? use.name : 'result';
+  const err = res && res.isError ? '<span class="err">error</span>' : '';
+  det.innerHTML = `<summary><span class="chev">▶</span><span class="tag">⚙ <span class="name">${esc(name)}</span></span>${err}</summary>`;
+  const body=document.createElement('div'); body.className='body';
+  if (use) { const l=document.createElement('div'); l.className='io-label'; l.textContent='input'; body.appendChild(l); const pre=document.createElement('pre'); pre.className='io'; pre.textContent=use.input||''; body.appendChild(pre); }
+  if (res) { const l=document.createElement('div'); l.className='io-label'; l.textContent=res.isError?'result (error)':'result'; body.appendChild(l); const pre=document.createElement('pre'); pre.className='io'; pre.textContent=res.text||'(no output)'; body.appendChild(pre); }
+  det.appendChild(body); return det;
+}
+function renderRaw(m) {
+  const det=document.createElement('details'); det.className='block tool';
+  det.innerHTML = `<summary><span class="chev">▶</span><span class="tag">unparsed line</span></summary>`;
+  const body=document.createElement('div'); body.className='body'; const pre=document.createElement('pre'); pre.className='io'; pre.textContent=m.text||''; body.appendChild(pre); det.appendChild(body); return det;
+}
+
+/* ---------- current-turn cursor + selection ---------- */
+function turnEls() { return [...document.querySelectorAll('#transcript .turn[data-vis]')]; }
+// Anchor the destination turn's top near the viewport top, leaving a sliver of the
+// previous turn visible. Works for turns taller than the viewport (they land near the top).
+function scrollTurnToTop(el) {
+  const wrap = $('#transcript');
+  const pad = 44;
+  const target = wrap.scrollTop + el.getBoundingClientRect().top - wrap.getBoundingClientRect().top - pad;
+  wrap.scrollTo({ top: Math.max(0, target) });
+}
+function setCurrent(i) {
+  const els = turnEls(); if (!els.length) return;
+  state.current = Math.max(0, Math.min(els.length - 1, i));
+  els.forEach((el, k) => el.classList.toggle('current', k === state.current));
+  scrollTurnToTop(els[state.current]);
+  syncSummaryCurrent();
+}
+function toggleSelect(id, shift) {
+  const ids = deletableTurns().map(t => t.id);
+  if (shift && state.lastClicked && state.lastClicked !== id) {
+    const a = ids.indexOf(state.lastClicked), b = ids.indexOf(id);
+    const [lo, hi] = a < b ? [a, b] : [b, a];
+    const adding = !state.selected.has(id);
+    for (let i = lo; i <= hi; i++) adding ? state.selected.add(ids[i]) : state.selected.delete(ids[i]);
+  } else {
+    state.selected.has(id) ? state.selected.delete(id) : state.selected.add(id);
+  }
+  state.lastClicked = id;
+  syncSelectionStyles(); updateToolbar();
+}
+function syncSelectionStyles() {
+  const turns = deletableTurns(); let i = 0;
+  turnEls().forEach(el => {
+    const t = turns[i++]; const on = state.selected.has(t.id);
+    el.classList.toggle('selected', on);
+    const box = el.querySelector('.turn-head .box'); if (box) box.textContent = on ? '✓' : '';
+  });
+  document.querySelectorAll('#sumList .sumitem').forEach((el, k) => {
+    const t = turns[k]; if (t) el.classList.toggle('selected', state.selected.has(t.id));
+  });
+}
+
+/* ---------- summary / outline pane ---------- */
+function sumUserText(t) { const ms = t.messages || []; const m = ms.find(x => x.kind === 'user' && !x.synthetic) || ms.find(x => x.kind === 'user'); return ((m && m.text) || '').trim(); }
+function sumReplyText(t) { return (t.messages || []).filter(x => x.kind === 'assistant').map(x => x.text).join('\n\n').trim(); }
+function renderSummary() {
+  const list = $('#sumList'); list.innerHTML = '';
+  const turns = deletableTurns();
+  if (!turns.length) { list.innerHTML = '<div class="placeholder">No turns in this session.</div>'; return; }
+  turns.forEach((t, i) => {
+    const item = document.createElement('div');
+    item.className = 'sumitem' + (state.selected.has(t.id) ? ' selected' : '');
+    item.dataset.vis = i;
+    const u = sumUserText(t), a = sumReplyText(t);
+    item.innerHTML =
+      `<div class="sh"><span class="mark"></span><span class="idx">#${i + 1}</span><span>${esc(fmtTime(t.timestamp))}</span></div>` +
+      `<div class="u clamp">${u ? esc(u) : '<span class="muted">(no text)</span>'}</div>` +
+      (a ? `<div class="a clamp">${esc(a)}</div>` : '');
+    item.onclick = () => setCurrent(i);
+    list.appendChild(item);
+  });
+  syncSummaryCurrent();
+}
+function syncSummaryCurrent() {
+  document.querySelectorAll('#sumList .sumitem').forEach((el, k) => {
+    const on = k === state.current;
+    el.classList.toggle('current', on);
+    if (on) el.scrollIntoView({ block: 'nearest' });
+  });
+}
+function applySumLines(n) {
+  n = Math.max(1, Math.min(12, (n | 0) || 2));
+  $('#sumList').style.setProperty('--sumLines', n);
+  $('#sumLines').value = n;
+  localStorage.setItem('cje.sumLines', n);
+}
+function updateToolbar() {
+  const sess = state.session; if (!sess) return;
+  const selBytes = sess.turns.filter(t => state.selected.has(t.id)).reduce((a,t)=>a+t.bytes,0);
+  $('#selInfo').textContent = state.selected.size ? `${state.selected.size} selected · ${fmtBytes(selBytes)}` : '';
+  $('#delBtn').disabled = !state.selected.size;
+  $('#undoBtn').disabled = !sess.canUndo;
+  $('#redoBtn').disabled = !sess.canRedo;
+}
+
+/* ---------- delete / undo / redo ---------- */
+$('#delBtn').onclick = openDeleteModal;
+function openDeleteModal() {
+  if (!state.selected.size) return;
+  const n = state.selected.size;
+  const bytes = state.session.turns.filter(t => state.selected.has(t.id)).reduce((a,t)=>a+t.bytes,0);
+  $('#modalText').textContent = `Remove ${n} turn${n===1?'':'s'} (${fmtBytes(bytes)}) from this session file.`;
+  $('#modalWrap').classList.add('show');
+}
+function hideModal() { $('#modalWrap').classList.remove('show'); }
+$('#modalWrap').onclick = (e) => { if (e.target.id === 'modalWrap') hideModal(); };
+$('#modalConfirm').onclick = async () => {
+  hideModal();
+  try {
+    const sess = await api(`/api/sessions/${state.slug}/${state.sid}/delete`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ turnIds:[...state.selected], hash: state.session.hash, showAll: state.showAll }),
+    });
+    state.selected.clear(); state.current = -1; refreshSession(sess); toast('Deleted — undo available');
+  } catch (e) { if (e.message !== 'conflict') toast(e.message, false); }
+};
+async function histOp(op) {
+  const sess = state.session; if (!sess) return;
+  if (op === 'undo' && !sess.canUndo) return;
+  if (op === 'redo' && !sess.canRedo) return;
+  try {
+    const res = await api(`/api/sessions/${state.slug}/${state.sid}/${op}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ hash: state.session.hash, showAll: state.showAll }),
+    });
+    refreshSession(res); toast(op === 'undo' ? 'Undone' : 'Redone');
+  } catch (e) { if (e.message !== 'conflict') toast(e.message, false); }
+}
+$('#undoBtn').onclick = () => histOp('undo');
+$('#redoBtn').onclick = () => histOp('redo');
+
+/* ---------- keyboard shortcuts ---------- */
+function comboFromEvent(e) {
+  const parts = [];
+  if (e.ctrlKey) parts.push('Ctrl');
+  if (e.altKey) parts.push('Alt');
+  if (e.shiftKey) parts.push('Shift');
+  if (e.metaKey) parts.push('Meta');
+  let k = e.key;
+  if (k === ' ') k = 'Space';
+  if (['Control','Alt','Shift','Meta'].includes(k)) return null; // modifier alone
+  if (k.length === 1) k = k.toLowerCase();
+  parts.push(k);
+  return parts.join('+');
+}
+const ACTION_LABELS = {
+  prevTurn:'Previous turn', nextTurn:'Next turn', scrollUp:'Scroll up (lines)', scrollDown:'Scroll down (lines)',
+  toggleSelect:'Select / deselect current', deleteSelected:'Delete selected', undo:'Undo', redo:'Redo',
+  firstTurn:'First turn', lastTurn:'Last turn', selectAll:'Select all', clearSelection:'Clear selection', help:'Shortcuts help',
+};
+const ACTIONS = {
+  prevTurn: () => setCurrent(state.current <= 0 ? 0 : state.current - 1),
+  nextTurn: () => setCurrent(state.current < 0 ? 0 : state.current + 1),
+  scrollUp: () => $('#transcript').scrollBy({ top: -120 }),
+  scrollDown: () => $('#transcript').scrollBy({ top: 120 }),
+  toggleSelect: () => { const t = deletableTurns()[state.current]; if (t) toggleSelect(t.id, false); },
+  deleteSelected: () => openDeleteModal(),
+  undo: () => histOp('undo'),
+  redo: () => histOp('redo'),
+  firstTurn: () => setCurrent(0),
+  lastTurn: () => setCurrent(turnEls().length - 1),
+  selectAll: () => { deletableTurns().forEach(t => state.selected.add(t.id)); syncSelectionStyles(); updateToolbar(); },
+  clearSelection: () => { state.selected.clear(); syncSelectionStyles(); updateToolbar(); },
+  help: () => toggleKeys(),
+};
+let capturing = null; // action currently being rebound
+document.addEventListener('keydown', (e) => {
+  const combo = comboFromEvent(e);
+  if (!combo) return;
+  // rebinding capture takes priority
+  if (capturing) { e.preventDefault(); assignKey(capturing, combo); return; }
+  const tag = (e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
+  if ($('#modalWrap').classList.contains('show')) {
+    if (combo === 'Escape') hideModal(); return;
+  }
+  if ($('#keysWrap').classList.contains('show')) { if (combo === 'Escape') hideKeys(); return; }
+  if ($('#infoWrap').classList.contains('show')) { if (combo === 'Escape') hideInfo(); return; }
+  // match against loaded keybindings
+  for (const [action, bound] of Object.entries(state.keys)) {
+    if (bound === combo && ACTIONS[action]) {
+      if (action !== 'help' && !state.session) return; // conversation actions need a session
+      e.preventDefault(); ACTIONS[action](); return;
+    }
+  }
+});
+
+/* ---------- shortcuts settings overlay ---------- */
+async function loadKeys() { state.keys = await api('/api/keybindings'); }
+function renderKeys() {
+  const body = $('#keysBody'); body.innerHTML = '';
+  for (const action of Object.keys(ACTION_LABELS)) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td class="act">${ACTION_LABELS[action]}</td><td class="combo"><span class="kbd" data-action="${action}">${esc(state.keys[action] || '—')}</span></td>`;
+    body.appendChild(tr);
+  }
+  body.querySelectorAll('.kbd').forEach(el => {
+    el.onclick = () => {
+      body.querySelectorAll('.kbd').forEach(k => k.classList.remove('capturing'));
+      el.classList.add('capturing'); el.textContent = 'press a key…';
+      capturing = el.dataset.action;
+    };
+  });
+}
+async function assignKey(action, combo) {
+  capturing = null;
+  // warn on conflict
+  const clash = Object.entries(state.keys).find(([a, c]) => c === combo && a !== action);
+  const next = { ...state.keys, [action]: combo };
+  try {
+    state.keys = await api('/api/keybindings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(next) });
+    renderKeys();
+    toast(clash ? `Bound (also used by "${ACTION_LABELS[clash[0]]}")` : 'Shortcut saved');
+  } catch (e) { renderKeys(); toast(e.message, false); }
+}
+$('#keysReset').onclick = async () => {
+  const defaults = { prevTurn:'ArrowUp', nextTurn:'ArrowDown', scrollUp:'Shift+ArrowUp', scrollDown:'Shift+ArrowDown',
+    toggleSelect:'Space', deleteSelected:'d', undo:'Ctrl+z', redo:'Ctrl+y', firstTurn:'Home', lastTurn:'End',
+    selectAll:'a', clearSelection:'Escape', help:'?' };
+  state.keys = await api('/api/keybindings', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(defaults) });
+  renderKeys(); toast('Reset to defaults');
+};
+function toggleKeys() { $('#keysWrap').classList.contains('show') ? hideKeys() : showKeys(); }
+function showKeys() { capturing = null; renderKeys(); $('#keysWrap').classList.add('show'); }
+function hideKeys() { capturing = null; $('#keysWrap').classList.remove('show'); }
+$('#keysWrap').onclick = (e) => { if (e.target.id === 'keysWrap') hideKeys(); };
+$('#helpBtn').onclick = showKeys;
+
+function hideInfo() { $('#infoWrap').classList.remove('show'); }
+$('#infoBtn').onclick = () => $('#infoWrap').classList.add('show');
+
+/* ---------- reading view  ⟷  show all ---------- */
+function updateShowAllBtn() {
+  const b = $('#showAllBtn');
+  b.textContent = state.showAll ? 'Reading view' : 'Show all';
+  b.classList.toggle('active', state.showAll);
+}
+$('#showAllBtn').onclick = async () => {
+  state.showAll = !state.showAll;
+  localStorage.setItem('cje.showAll', state.showAll ? '1' : '0');
+  updateShowAllBtn();
+  // grouping changes with the mode (synthetic entries become their own turns),
+  // so refetch; selection is remapped by refreshSession, reset the cursor.
+  if (state.slug && state.sid) {
+    state.current = -1;
+    refreshSession(await api(sessionUrl(state.slug, state.sid)));
+  }
+};
+updateShowAllBtn();
+$('#infoWrap').onclick = (e) => { if (e.target.id === 'infoWrap') hideInfo(); };
+
+/* ---------- splitter ---------- */
+function initSplitters() {
+  const widths = JSON.parse(localStorage.getItem('cje.paneWidths') || '{}');
+  for (const [id, w] of Object.entries(widths)) { const el = document.getElementById(id); if (el) el.style.width = w + 'px'; }
+  document.querySelectorAll('.splitter').forEach(sp => {
+    const target = document.getElementById(sp.dataset.target);
+    const side = sp.dataset.side;   // 'right' pane grows when dragged left
+    sp.addEventListener('mousedown', (e) => {
+      e.preventDefault(); sp.classList.add('dragging');
+      const startX = e.clientX, startW = target.offsetWidth;
+      const move = (ev) => {
+        const dx = ev.clientX - startX;
+        const raw = side === 'right' ? startW - dx : startW + dx;
+        target.style.width = Math.max(170, Math.min(700, raw)) + 'px';
+      };
+      const up = () => {
+        sp.classList.remove('dragging');
+        document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up);
+        const cur = JSON.parse(localStorage.getItem('cje.paneWidths') || '{}');
+        cur[sp.dataset.target] = target.offsetWidth; localStorage.setItem('cje.paneWidths', JSON.stringify(cur));
+      };
+      document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
+    });
+  });
+}
+
+/* ---------- boot ---------- */
+$('#sumLines').addEventListener('input', (e) => applySumLines(+e.target.value));
+applySumLines(+(localStorage.getItem('cje.sumLines') || 2));
+initSplitters();
+Promise.all([loadKeys(), loadTree()]);
+</script>
+</body>
+</html>
