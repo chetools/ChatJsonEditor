@@ -1,0 +1,12 @@
+{
+  "info": {
+    "id": "sess-build",
+    "cwd": "C:\\test\\BuildProject"
+  },
+  "session_summary": "Build session",
+  "generated_title": "Build session",
+  "current_model_id": "grok-4.5",
+  "agent_name": "grok-build-plan",
+  "num_messages": 2,
+  "num_chat_messages": 3
+}

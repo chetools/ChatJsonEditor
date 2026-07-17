@@ -19,7 +19,8 @@ from pathlib import Path
 
 HEADER_TURN_ID = "__header__"
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# Allow URL-encoded path segments (Grok uses %3A etc.) and UUIDs.
+_NAME_RE = re.compile(r"^[A-Za-z0-9._%-]+$")
 
 
 class ConflictError(Exception):
@@ -45,6 +46,30 @@ def config_root() -> Path:
     if override:
         return Path(override)
     return Path.home() / ".claude" / "chatjsoneditor"
+
+
+def grok_sessions_root() -> Path:
+    override = os.environ.get("GROK_SESSIONS_DIR")
+    if override:
+        return Path(override)
+    home = os.environ.get("GROK_HOME")
+    if home:
+        return Path(home) / "sessions"
+    return Path.home() / ".grok" / "sessions"
+
+
+def gemini_tmp_root() -> Path:
+    override = os.environ.get("GEMINI_TMP_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".gemini" / "tmp"
+
+
+def antigravity_root() -> Path:
+    override = os.environ.get("ANTIGRAVITY_ROOT")
+    if override:
+        return Path(override)
+    return Path.home() / ".gemini" / "antigravity"
 
 
 # Default keyboard shortcuts (action -> combo string). Combos are normalized as
@@ -183,6 +208,32 @@ def atomic_write(path: Path, text: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Atomic-ish binary write; falls back to in-place rewrite on Windows locks."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            # Destination may be briefly locked (e.g. SQLite on Windows).
+            with open(path, "wb") as f:
+                f.write(data)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     except BaseException:
         try:
             os.unlink(tmp)
@@ -522,10 +573,16 @@ def list_sessions(slug: str) -> list[dict]:
 # ------------------------------------------------------------ undo/redo
 
 class History:
-    """Whole-file snapshot stacks for one session, persisted on disk."""
+    """Snapshot stacks for one session, persisted on disk.
 
-    def __init__(self, slug: str, sid: str):
-        self.dir = backups_root() / safe_name(slug) / safe_name(sid)
+    Supports a single text file (Claude/Gemini) or a named multi-file bundle
+    (Grok, Antigravity). Legacy single-file snapshots are `NNNN.jsonl` bytes;
+    bundles are directories `NNNN/` containing the named files.
+    """
+
+    def __init__(self, slug: str, sid: str, source: str = "claude"):
+        self.source = source
+        self.dir = backups_root() / safe_name(source) / safe_name(slug) / safe_name(sid)
         self.state_path = self.dir / "state.json"
 
     def _load(self) -> dict:
@@ -540,12 +597,27 @@ class History:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
-    def _snapshot(self, state: dict, content: bytes) -> str:
+    def _snapshot_bytes(self, state: dict, content: bytes, suffix: str = ".jsonl") -> str:
         state["counter"] += 1
-        name = f"{state['counter']:04d}.jsonl"
+        name = f"{state['counter']:04d}{suffix}"
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / name).write_bytes(content)
         return name
+
+    def _snapshot_bundle(self, state: dict, files: dict[str, bytes]) -> str:
+        state["counter"] += 1
+        name = f"{state['counter']:04d}"
+        snap = self.dir / name
+        snap.mkdir(parents=True, exist_ok=True)
+        for rel, data in files.items():
+            (snap / rel).write_bytes(data)
+        return name
+
+    def _read_bundle(self, name: str) -> dict[str, bytes]:
+        snap = self.dir / name
+        if not snap.is_dir():
+            raise ValueError(f"missing snapshot bundle: {name}")
+        return {p.name: p.read_bytes() for p in snap.iterdir() if p.is_file()}
 
     def status(self) -> dict:
         state = self._load()
@@ -553,41 +625,144 @@ class History:
 
     def record_and_write(self, path: Path, new_text: str) -> None:
         state = self._load()
-        name = self._snapshot(state, path.read_bytes())
+        name = self._snapshot_bytes(state, path.read_bytes())
         state["undo"].append(name)
         state["redo"] = []
         atomic_write(path, new_text)
+        self._save(state)
+
+    def record_and_write_bytes(self, path: Path, new_bytes: bytes) -> None:
+        state = self._load()
+        name = self._snapshot_bytes(state, path.read_bytes(), suffix=".bin")
+        state["undo"].append(name)
+        state["redo"] = []
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(new_bytes)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        self._save(state)
+
+    def record_and_write_bundle(
+        self, paths: dict[str, Path], new_data: dict[str, bytes]
+    ) -> None:
+        """Snapshot current files, then write new_data (rel name → bytes)."""
+        state = self._load()
+        current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
+        name = self._snapshot_bundle(state, current)
+        state["undo"].append(name)
+        state["redo"] = []
+        for rel, data in new_data.items():
+            p = paths[rel]
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(data, str):
+                atomic_write(p, data)
+            else:
+                _atomic_write_bytes(p, data)
         self._save(state)
 
     def undo(self, path: Path) -> None:
         state = self._load()
         if not state["undo"]:
             raise ValueError("nothing to undo")
-        current = self._snapshot(state, path.read_bytes())
+        current = self._snapshot_bytes(state, path.read_bytes())
         name = state["undo"].pop()
         restored = (self.dir / name).read_bytes()
         state["redo"].append(current)
-        atomic_write(path, restored.decode("utf-8"))
+        # binary-safe when snapshot is .bin; text otherwise
+        if name.endswith(".bin"):
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(restored)
+                os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        else:
+            atomic_write(path, restored.decode("utf-8"))
         self._save(state)
 
     def redo(self, path: Path) -> None:
         state = self._load()
         if not state["redo"]:
             raise ValueError("nothing to redo")
-        current = self._snapshot(state, path.read_bytes())
+        current = self._snapshot_bytes(state, path.read_bytes())
         name = state["redo"].pop()
         restored = (self.dir / name).read_bytes()
         state["undo"].append(current)
-        atomic_write(path, restored.decode("utf-8"))
+        if name.endswith(".bin"):
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(restored)
+                os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        else:
+            atomic_write(path, restored.decode("utf-8"))
+        self._save(state)
+
+    def undo_bundle(self, paths: dict[str, Path]) -> None:
+        state = self._load()
+        if not state["undo"]:
+            raise ValueError("nothing to undo")
+        current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
+        cur_name = self._snapshot_bundle(state, current)
+        name = state["undo"].pop()
+        restored = self._read_bundle(name)
+        state["redo"].append(cur_name)
+        for rel, data in restored.items():
+            p = paths.get(rel)
+            if p is None:
+                continue
+            _atomic_write_bytes(p, data)
+        self._save(state)
+
+    def redo_bundle(self, paths: dict[str, Path]) -> None:
+        state = self._load()
+        if not state["redo"]:
+            raise ValueError("nothing to redo")
+        current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
+        cur_name = self._snapshot_bundle(state, current)
+        name = state["redo"].pop()
+        restored = self._read_bundle(name)
+        state["undo"].append(cur_name)
+        for rel, data in restored.items():
+            p = paths.get(rel)
+            if p is None:
+                continue
+            _atomic_write_bytes(p, data)
         self._save(state)
 
 
 # ------------------------------------------------------------ operations
 
-def check_hash(path: Path, expected: str) -> None:
+def check_hash(path: Path, expected: str, product: str = "the app") -> None:
     if file_hash(path) != expected:
         raise ConflictError(
-            "The session file changed on disk (is it open in Claude Code?). "
+            f"The session file changed on disk (is it open in {product}?). "
+            "Reload before editing."
+        )
+
+
+def check_hash_value(actual: str, expected: str, product: str = "the app") -> None:
+    if actual != expected:
+        raise ConflictError(
+            f"The session file changed on disk (is it open in {product}?). "
             "Reload before editing."
         )
 
@@ -595,20 +770,32 @@ def check_hash(path: Path, expected: str) -> None:
 def perform_delete(slug: str, sid: str, turn_ids: list[str], expected_hash: str,
                    fold_synthetic: bool = True) -> None:
     path = session_path(slug, sid)
-    check_hash(path, expected_hash)
+    check_hash(path, expected_hash, "Claude Code")
     doc = load_session(path)
     new_entries = delete_turns(doc, turn_ids, fold_synthetic)
     new_doc = SessionDoc(path=path, entries=new_entries, trailing_newline=doc.trailing_newline)
-    History(slug, sid).record_and_write(path, new_doc.text())
+    History(slug, sid, source="claude").record_and_write(path, new_doc.text())
 
 
 def perform_undo(slug: str, sid: str, expected_hash: str) -> None:
     path = session_path(slug, sid)
-    check_hash(path, expected_hash)
-    History(slug, sid).undo(path)
+    check_hash(path, expected_hash, "Claude Code")
+    History(slug, sid, source="claude").undo(path)
 
 
 def perform_redo(slug: str, sid: str, expected_hash: str) -> None:
     path = session_path(slug, sid)
-    check_hash(path, expected_hash)
-    History(slug, sid).redo(path)
+    check_hash(path, expected_hash, "Claude Code")
+    History(slug, sid, source="claude").redo(path)
+
+
+def multi_file_hash(paths: list[Path]) -> str:
+    """Stable hash over several files (missing files contribute empty)."""
+    h = hashlib.sha256()
+    for p in paths:
+        h.update(p.name.encode("utf-8"))
+        h.update(b"\0")
+        if p.is_file():
+            h.update(p.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()

@@ -1,4 +1,4 @@
-"""FastAPI server for the Claude Code session editor."""
+"""FastAPI server for multi-source chat session editor."""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import sessions as S
+from .providers import get_provider, list_sources
 
 app = FastAPI(title="ChatJsonEditor")
 
@@ -23,44 +24,44 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
-# serve vendored JS/CSS (marked, DOMPurify, MathJax) and any other static assets
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-@app.get("/api/projects")
-def projects():
-    return S.list_projects()
+@app.get("/api/sources")
+def sources():
+    return list_sources()
 
 
-@app.get("/api/projects/{slug}/sessions")
-def project_sessions(slug: str):
+def _provider(source: str):
     try:
-        return S.list_sessions(slug)
+        return get_provider(source)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
 
-def _session_payload(slug: str, sid: str, fold_synthetic: bool = True) -> dict:
-    path = S.session_path(slug, sid)
-    if not path.is_file():
-        raise HTTPException(404, f"no such session: {sid}")
-    doc = S.load_session(path)
-    return {
-        "slug": slug,
-        "sid": sid,
-        "hash": S.file_hash(path),
-        "bytes": path.stat().st_size,
-        "turns": S.summarize_session(doc, fold_synthetic),
-        **S.History(slug, sid).status(),
-    }
+@app.get("/api/{source}/projects")
+def projects(source: str):
+    return _provider(source).list_projects()
 
 
-@app.get("/api/sessions/{slug}/{sid}")
-def session_detail(slug: str, sid: str, showAll: bool = False):
+@app.get("/api/{source}/projects/{slug}/sessions")
+def project_sessions(source: str, slug: str):
     try:
-        return _session_payload(slug, sid, fold_synthetic=not showAll)
+        return _provider(source).list_sessions(slug)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@app.get("/api/{source}/sessions/{slug}/{sid}")
+def session_detail(source: str, slug: str, sid: str, showAll: bool = False):
+    try:
+        return _provider(source).session_payload(slug, sid, fold_synthetic=not showAll)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except S.ConflictError as e:
+        raise HTTPException(409, str(e))
 
 
 class DeleteBody(BaseModel):
@@ -74,7 +75,7 @@ class HashBody(BaseModel):
     showAll: bool = False
 
 
-def _mutate(fn, slug: str, sid: str, fold_synthetic: bool = True):
+def _mutate(source: str, slug: str, sid: str, fn, fold_synthetic: bool = True):
     try:
         fn()
     except S.ConflictError as e:
@@ -83,30 +84,80 @@ def _mutate(fn, slug: str, sid: str, fold_synthetic: bool = True):
         raise HTTPException(400, str(e))
     except FileNotFoundError:
         raise HTTPException(404, "session file not found")
-    return _session_payload(slug, sid, fold_synthetic=fold_synthetic)
+    return _provider(source).session_payload(slug, sid, fold_synthetic=fold_synthetic)
 
 
-@app.post("/api/sessions/{slug}/{sid}/delete")
-def delete_turns(slug: str, sid: str, body: DeleteBody):
+@app.post("/api/{source}/sessions/{slug}/{sid}/delete")
+def delete_turns(source: str, slug: str, sid: str, body: DeleteBody):
     if not body.turnIds:
         raise HTTPException(400, "no turns selected")
     fold = not body.showAll
+    p = _provider(source)
     return _mutate(
-        lambda: S.perform_delete(slug, sid, body.turnIds, body.hash, fold_synthetic=fold),
-        slug, sid, fold_synthetic=fold,
+        source, slug, sid,
+        lambda: p.perform_delete(slug, sid, body.turnIds, body.hash, fold_synthetic=fold),
+        fold_synthetic=fold,
     )
 
 
+@app.post("/api/{source}/sessions/{slug}/{sid}/undo")
+def undo(source: str, slug: str, sid: str, body: HashBody):
+    p = _provider(source)
+    return _mutate(
+        source, slug, sid,
+        lambda: p.perform_undo(slug, sid, body.hash),
+        fold_synthetic=not body.showAll,
+    )
+
+
+@app.post("/api/{source}/sessions/{slug}/{sid}/redo")
+def redo(source: str, slug: str, sid: str, body: HashBody):
+    p = _provider(source)
+    return _mutate(
+        source, slug, sid,
+        lambda: p.perform_redo(slug, sid, body.hash),
+        fold_synthetic=not body.showAll,
+    )
+
+
+# ---- Legacy Claude-only routes (default source=claude) ----
+
+@app.get("/api/projects")
+def legacy_projects():
+    return _provider("claude").list_projects()
+
+
+@app.get("/api/projects/{slug}/sessions")
+def legacy_project_sessions(slug: str):
+    try:
+        return _provider("claude").list_sessions(slug)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/sessions/{slug}/{sid}")
+def legacy_session_detail(slug: str, sid: str, showAll: bool = False):
+    try:
+        return _provider("claude").session_payload(slug, sid, fold_synthetic=not showAll)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/sessions/{slug}/{sid}/delete")
+def legacy_delete(slug: str, sid: str, body: DeleteBody):
+    return delete_turns("claude", slug, sid, body)
+
+
 @app.post("/api/sessions/{slug}/{sid}/undo")
-def undo(slug: str, sid: str, body: HashBody):
-    return _mutate(lambda: S.perform_undo(slug, sid, body.hash), slug, sid,
-                   fold_synthetic=not body.showAll)
+def legacy_undo(slug: str, sid: str, body: HashBody):
+    return undo("claude", slug, sid, body)
 
 
 @app.post("/api/sessions/{slug}/{sid}/redo")
-def redo(slug: str, sid: str, body: HashBody):
-    return _mutate(lambda: S.perform_redo(slug, sid, body.hash), slug, sid,
-                   fold_synthetic=not body.showAll)
+def legacy_redo(slug: str, sid: str, body: HashBody):
+    return redo("claude", slug, sid, body)
 
 
 @app.get("/api/keybindings")
@@ -125,7 +176,10 @@ def set_keybindings(mapping: dict):
 def main():
     import uvicorn
 
-    parser = argparse.ArgumentParser(description="Claude Code session editor")
+    parser = argparse.ArgumentParser(
+        description="Local multi-source chat session editor "
+        "(Claude Code, Grok, Grok Build, Gemini CLI, Antigravity)"
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8642)
     parser.add_argument("--no-browser", action="store_true", help="don't open a browser tab")

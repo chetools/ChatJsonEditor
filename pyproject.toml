@@ -1,7 +1,7 @@
 [project]
 name = "chatjsoneditor"
 version = "0.1.0"
-description = "Local web editor for Claude Code session JSONL files: delete and undo whole turns."
+description = "Local web editor for Claude Code, Grok, Grok Build, Gemini CLI, and Antigravity sessions: delete and undo whole turns."
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.110",

@@ -1,0 +1,8 @@
+{"timestamp":1,"method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"first prompt"}}}}
+{"timestamp":2,"method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking about first"}}}}
+{"timestamp":3,"method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply one"}}}}
+{"timestamp":4,"method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"list_dir"}}}
+{"timestamp":5,"method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"turn_completed"}}}
+{"timestamp":6,"method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"second prompt"}}}}
+{"timestamp":7,"method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply two"}}}}
+{"timestamp":8,"method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"turn_completed"}}}

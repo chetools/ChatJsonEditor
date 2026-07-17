@@ -1,0 +1,14 @@
+{
+  "info": {
+    "id": "sess1",
+    "cwd": "C:\\test\\Project"
+  },
+  "session_summary": "Test Grok session",
+  "generated_title": "Test Grok session",
+  "created_at": "2026-07-01T00:00:00Z",
+  "updated_at": "2026-07-01T00:10:00Z",
+  "num_messages": 6,
+  "num_chat_messages": 8,
+  "current_model_id": "grok-4.5",
+  "agent_name": "cursor"
+}

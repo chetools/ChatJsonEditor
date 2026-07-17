@@ -1,0 +1,8 @@
+{"type":"system","content":"You are Grok."}
+{"type":"user","content":[{"type":"text","text":"<user_info>\nWorkspace\n</user_info>"}]}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nfirst prompt\n</user_query>"}]}
+{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking about first"}]}
+{"type":"assistant","content":"reply one","tool_calls":[{"id":"call-1","name":"list_dir","arguments":"{\"target_directory\":\".\"}"}]}
+{"type":"tool_result","tool_call_id":"call-1","content":"file.txt"}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nsecond prompt\n</user_query>"}]}
+{"type":"assistant","content":"reply two"}

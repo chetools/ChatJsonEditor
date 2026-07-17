@@ -1,0 +1,13 @@
+{
+  "sessionId": "session-1",
+  "messages": [
+    {"role": "user", "parts": [{"text": "hello gemini"}]},
+    {"role": "model", "parts": [{"text": "hi there"}]},
+    {"role": "user", "parts": [{"text": "second turn"}]},
+    {"role": "model", "parts": [
+      {"text": "using a tool"},
+      {"functionCall": {"name": "read_file", "args": {"path": "a.txt"}}}
+    ]},
+    {"role": "user", "parts": [{"functionResponse": {"name": "read_file", "response": {"content": "file body"}}}]}
+  ]
+}

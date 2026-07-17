@@ -1,0 +1,3 @@
+{"type":"system","content":"You are Grok Build."}
+{"type":"user","content":[{"type":"text","text":"<user_query>\nplan something\n</user_query>"}]}
+{"type":"assistant","content":"planning"}

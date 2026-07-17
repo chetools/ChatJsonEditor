@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ChatJsonEditor — Claude Code sessions</title>
+<title>ChatJsonEditor — multi-source sessions</title>
 <script>
   window.MathJax = {
     tex: {
@@ -59,6 +59,8 @@
   .row.project .lbl { color: var(--text); font-weight: 550; }
   .row.session { color: var(--text2); }
   .row.session .sub { color: var(--faint); font-size: 11.5px; margin-left: 6px; }
+  .row.source { color: var(--text); font-weight: 650; font-size: 13px; }
+  .row.source .badge { font-size: 10.5px; color: var(--faint); font-weight: 500; margin-left: 6px; }
   .children { overflow: hidden; }
   .placeholder { color: var(--faint); padding: 20px 12px; font-size: 13px; }
   .loading { color: var(--faint); font-size: 12px; padding: 4px 6px; }
@@ -176,11 +178,11 @@
   <div class="splitter" data-target="explorerPane"></div>
 
   <div class="pane" id="conversationPane">
-    <div id="banner">The session file changed on disk — it may be open in Claude Code.<button class="btn" onclick="reloadSession()">Reload</button></div>
+    <div id="banner">The session file changed on disk — it may be open in the source app.<button class="btn" onclick="reloadSession()">Reload</button></div>
     <div id="toolbar" style="display:none">
       <span class="ct" id="convTitle"></span>
       <span class="sel" id="selInfo"></span>
-      <button class="btn" id="infoBtn" title="How edits reach Claude">ⓘ</button>
+      <button class="btn" id="infoBtn" title="How edits reach the source app">ⓘ</button>
       <button class="btn" id="showAllBtn" title="Reading view shows only prompts &amp; replies. Show all reveals thinking, tools, and command/notification entries (and splits them into their own turns).">Show all</button>
       <button class="btn" id="delBtn" disabled>Delete</button>
       <button class="btn" id="undoBtn" disabled>↶ Undo</button>
@@ -225,19 +227,20 @@
   </div>
 </div>
 
-<!-- info: how edits reach Claude -->
+<!-- info: how edits reach the source app -->
 <div class="overlay" id="infoWrap">
   <div class="sheet" style="width:min(500px,92vw)">
-    <h2>How edits reach Claude</h2>
+    <h2>How edits reach the source app</h2>
     <div class="infonote">
-      Edits are written to the session's <code>.jsonl</code> immediately, but Claude Desktop does not
-      watch the file — an open conversation keeps its in-memory copy.
+      ChatJsonEditor writes directly to each product's on-disk session store
+      (Claude Code JSONL, Grok session dirs, Gemini CLI chats, Antigravity SQLite).
+      Most apps keep an in-memory copy of an already-open conversation.
       <ul style="margin:10px 0 0;padding-left:18px">
-        <li><b>Best:</b> edit a session that isn't currently open, then open/resume it in Claude.</li>
-        <li>If it's already open, quit and reopen Claude Desktop (the session list re-reads from disk on launch).</li>
-        <li>CLI <code>claude --resume &lt;id&gt;</code> always reads the file fresh.</li>
+        <li><b>Best:</b> edit a session that isn't currently open, then resume it in the source app.</li>
+        <li>If it's already open, quit and reopen the app so it re-reads from disk.</li>
+        <li>Delete is whole-turn only so tool calls stay paired with their results.</li>
       </ul>
-      <p style="margin:10px 0 0;color:var(--dim)">If a session is being written by Claude while you edit, the save is blocked (409) and you'll see a reload banner.</p>
+      <p style="margin:10px 0 0;color:var(--dim)">If a session is being written while you edit, the save is blocked (409) and you'll see a reload banner.</p>
     </div>
     <div class="row-actions"><button class="btn" onclick="hideInfo()">Got it</button></div>
   </div>
@@ -248,10 +251,11 @@
 <script>
 const $ = (s) => document.querySelector(s);
 const state = {
-  slug: null, sid: null, title: null, session: null,
+  source: null, slug: null, sid: null, title: null, session: null, productName: null,
   selected: new Set(), lastClicked: null, current: -1,
   keys: {}, expanded: new Set(JSON.parse(localStorage.getItem('cje.expanded') || '[]')),
   showAll: localStorage.getItem('cje.showAll') === '1',
+  sources: [],
 };
 
 const fmtBytes = (n) => n > 1048576 ? (n/1048576).toFixed(1)+' MB' : n > 1024 ? (n/1024).toFixed(1)+' KB' : n+' B';
@@ -301,15 +305,66 @@ function buildTree(projects) {
 }
 function pathKey(segs) { return segs.join('/'); }
 
-function renderTree(root) {
+function renderSourceTree(sources) {
   const container = $('#tree'); container.innerHTML = '';
   const frag = document.createDocumentFragment();
-  // skip the empty root; render its children, compacting single-child folder chains
-  for (const child of root.children.values()) renderNode(child, [], frag, 0);
-  if (!root.children.size) frag.appendChild(Object.assign(document.createElement('div'), {className:'placeholder', textContent:'No projects found'}));
+  if (!sources.length) {
+    frag.appendChild(Object.assign(document.createElement('div'), {
+      className: 'placeholder', textContent: 'No sources registered',
+    }));
+    container.appendChild(frag);
+    return;
+  }
+  for (const src of sources) renderSourceNode(src, frag);
   container.appendChild(frag);
 }
-function renderNode(node, prefix, parent, depth) {
+
+function renderSourceNode(src, parent) {
+  const key = `src:${src.id}`;
+  const wrap = document.createElement('div'); wrap.className = 'node';
+  const row = document.createElement('div');
+  row.className = 'row source';
+  const open = state.expanded.has(key);
+  if (open) row.classList.add('open');
+  row.innerHTML = `<span class="disc">▶</span><span class="ico">🗂</span><span class="lbl">${esc(src.label)}</span>`;
+  wrap.appendChild(row);
+  const kids = document.createElement('div'); kids.className = 'children';
+  kids.style.paddingLeft = '10px';
+  kids.style.display = open ? 'block' : 'none';
+  wrap.appendChild(kids);
+  parent.appendChild(wrap);
+
+  let projectsLoaded = false;
+  async function loadProjects() {
+    if (projectsLoaded) return;
+    projectsLoaded = true;
+    const ph = document.createElement('div'); ph.className = 'loading'; ph.textContent = 'loading projects…';
+    kids.appendChild(ph);
+    try {
+      const projects = await api(`/api/${src.id}/projects`);
+      ph.remove();
+      if (!projects.length) {
+        kids.appendChild(Object.assign(document.createElement('div'), {
+          className: 'loading', textContent: 'no projects',
+        }));
+        return;
+      }
+      const tree = buildTree(projects);
+      for (const child of tree.children.values()) renderNode(child, [src.id], kids, 0, src);
+    } catch (e) { ph.textContent = 'error: ' + e.message; }
+  }
+  function setOpen(nowOpen) {
+    if (nowOpen) state.expanded.add(key); else state.expanded.delete(key);
+    localStorage.setItem('cje.expanded', JSON.stringify([...state.expanded]));
+    row.classList.toggle('open', nowOpen);
+    kids.style.display = nowOpen ? 'block' : 'none';
+    if (nowOpen) loadProjects();
+  }
+  row.onclick = () => setOpen(!state.expanded.has(key));
+  if (open) loadProjects();
+}
+
+function renderNode(node, prefix, parent, depth, src) {
   // compact single-child folder chains (VS Code style)
   let label = node.name, cur = node, segs = [...prefix, node.name];
   while (!cur.project && cur.children.size === 1) {
@@ -326,7 +381,7 @@ function renderNode(node, prefix, parent, depth) {
   const open = state.expanded.has(key);
   if (open) row.classList.add('open');
   const disc = (hasChildren || isProject) ? '▶' : '';
-  row.innerHTML = `<span class="disc">${disc}</span><span class="ico">${isProject ? '💬' : '📁'}</span><span class="lbl" title="${esc(segs.join('/'))}">${esc(label)}</span>`;
+  row.innerHTML = `<span class="disc">${disc}</span><span class="ico">${isProject ? '💬' : '📁'}</span><span class="lbl" title="${esc(segs.slice(1).join('/'))}">${esc(label)}</span>`;
   wrap.appendChild(row);
   const kids = document.createElement('div'); kids.className = 'children';
   kids.style.paddingLeft = '13px';
@@ -341,10 +396,10 @@ function renderNode(node, prefix, parent, depth) {
     const ph = document.createElement('div'); ph.className = 'loading'; ph.textContent = 'loading sessions…';
     kids.appendChild(ph);
     try {
-      const sessions = await api(`/api/projects/${node2.project.slug}/sessions`);
+      const sessions = await api(`/api/${src.id}/projects/${encodeURIComponent(node2.project.slug)}/sessions`);
       ph.remove();
       if (!sessions.length) { const e = document.createElement('div'); e.className = 'loading'; e.textContent = 'no sessions'; kids.appendChild(e); }
-      for (const sdata of sessions) kids.appendChild(renderSession(node2.project.slug, sdata));
+      for (const sdata of sessions) kids.appendChild(renderSession(src, node2.project.slug, sdata));
     } catch (e) { ph.textContent = 'error: ' + e.message; }
   }
   function setOpen(nowOpen) {
@@ -356,46 +411,55 @@ function renderNode(node, prefix, parent, depth) {
   }
   row.onclick = () => setOpen(!state.expanded.has(key));
   // folder children render eagerly (cheap); project sessions load lazily on open
-  if (node2.children.size) for (const c of node2.children.values()) renderNode(c, segs, kids, depth + 1);
+  if (node2.children.size) for (const c of node2.children.values()) renderNode(c, segs, kids, depth + 1, src);
   if (isProject && open) loadProjectSessions();
 }
-function renderSession(slug, s) {
+function renderSession(src, slug, s) {
   const row = document.createElement('div');
   row.className = 'row session'; row.dataset.sid = s.sid;
-  row.innerHTML = `<span class="disc"></span><span class="ico">📄</span><span class="lbl">${esc(s.title)}<span class="sub">${s.turnCount}t · ${fmtBytes(s.bytes)}</span></span>`;
-  row.onclick = (e) => { e.stopPropagation(); markActiveSession(row); openSession(slug, s.sid, s.title); };
+  const extra = s.model ? ` · ${esc(s.model)}` : '';
+  row.innerHTML = `<span class="disc"></span><span class="ico">📄</span><span class="lbl">${esc(s.title)}<span class="sub">${s.turnCount}t · ${fmtBytes(s.bytes)}${extra}</span></span>`;
+  row.onclick = (e) => { e.stopPropagation(); markActiveSession(row); openSession(src, slug, s.sid, s.title); };
   return row;
 }
 function markActiveSession(row) {
   document.querySelectorAll('#tree .row.session.active').forEach(x => x.classList.remove('active'));
   row.classList.add('active');
 }
-$('#collapseAll').onclick = () => { state.expanded.clear(); localStorage.setItem('cje.expanded', '[]'); renderTree(treeRoot); };
+$('#collapseAll').onclick = () => { state.expanded.clear(); localStorage.setItem('cje.expanded', '[]'); renderSourceTree(state.sources); };
 
-let treeRoot = null;
 async function loadTree() {
-  const projects = await api('/api/projects');
-  treeRoot = buildTree(projects);
-  renderTree(treeRoot);
+  state.sources = await api('/api/sources');
+  renderSourceTree(state.sources);
 }
 
 /* ---------- session loading ---------- */
-function sessionUrl(slug, sid) { return `/api/sessions/${slug}/${sid}${state.showAll ? '?showAll=1' : ''}`; }
-async function openSession(slug, sid, title) {
+function sessionUrl(source, slug, sid) {
+  return `/api/${source}/sessions/${encodeURIComponent(slug)}/${encodeURIComponent(sid)}${state.showAll ? '?showAll=1' : ''}`;
+}
+async function openSession(src, slug, sid, title) {
+  state.source = src.id; state.productName = src.productName || src.label;
   state.slug = slug; state.sid = sid; state.title = title;
   state.selected = new Set(); state.lastClicked = null; state.current = -1;
-  refreshSession(await api(sessionUrl(slug, sid)));
+  refreshSession(await api(sessionUrl(state.source, slug, sid)));
 }
 async function reloadSession() {
   $('#banner').style.display = 'none';
-  if (state.slug && state.sid) refreshSession(await api(sessionUrl(state.slug, state.sid)));
+  if (state.source && state.slug && state.sid) {
+    refreshSession(await api(sessionUrl(state.source, state.slug, state.sid)));
+  }
 }
 function refreshSession(sess) {
   state.session = sess;
+  if (sess.source) state.source = sess.source;
   state.selected = new Set([...state.selected].filter(id => sess.turns.some(t => t.id === id)));
   $('#banner').style.display = 'none';
+  const product = state.productName || state.source || 'the app';
+  const banner = $('#banner');
+  banner.innerHTML = `The session file changed on disk — it may be open in ${esc(product)}.<button class="btn" onclick="reloadSession()">Reload</button>`;
   $('#toolbar').style.display = 'flex';
-  $('#convTitle').textContent = `${state.title || state.sid} · ${fmtBytes(sess.bytes)}`;
+  const srcLabel = state.sources.find(s => s.id === state.source)?.label || state.source || '';
+  $('#convTitle').textContent = `${srcLabel ? srcLabel + ' · ' : ''}${state.title || state.sid} · ${fmtBytes(sess.bytes)}`;
   renderTranscript();
   renderSummary();
 }
@@ -588,7 +652,8 @@ $('#modalWrap').onclick = (e) => { if (e.target.id === 'modalWrap') hideModal();
 $('#modalConfirm').onclick = async () => {
   hideModal();
   try {
-    const sess = await api(`/api/sessions/${state.slug}/${state.sid}/delete`, {
+    const base = `/api/${state.source}/sessions/${encodeURIComponent(state.slug)}/${encodeURIComponent(state.sid)}`;
+    const sess = await api(`${base}/delete`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ turnIds:[...state.selected], hash: state.session.hash, showAll: state.showAll }),
     });
@@ -600,7 +665,8 @@ async function histOp(op) {
   if (op === 'undo' && !sess.canUndo) return;
   if (op === 'redo' && !sess.canRedo) return;
   try {
-    const res = await api(`/api/sessions/${state.slug}/${state.sid}/${op}`, {
+    const base = `/api/${state.source}/sessions/${encodeURIComponent(state.slug)}/${encodeURIComponent(state.sid)}`;
+    const res = await api(`${base}/${op}`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ hash: state.session.hash, showAll: state.showAll }),
     });
@@ -722,9 +788,9 @@ $('#showAllBtn').onclick = async () => {
   updateShowAllBtn();
   // grouping changes with the mode (synthetic entries become their own turns),
   // so refetch; selection is remapped by refreshSession, reset the cursor.
-  if (state.slug && state.sid) {
+  if (state.source && state.slug && state.sid) {
     state.current = -1;
-    refreshSession(await api(sessionUrl(state.slug, state.sid)));
+    refreshSession(await api(sessionUrl(state.source, state.slug, state.sid)));
   }
 };
 updateShowAllBtn();

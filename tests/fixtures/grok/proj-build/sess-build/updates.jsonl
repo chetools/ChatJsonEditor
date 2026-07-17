@@ -1,0 +1,2 @@
+{"timestamp":1,"method":"session/update","params":{"sessionId":"sess-build","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"plan something"}}}}
+{"timestamp":2,"method":"session/update","params":{"sessionId":"sess-build","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"planning"}}}}
