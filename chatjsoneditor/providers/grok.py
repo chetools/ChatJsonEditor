@@ -272,7 +272,8 @@ def _group_update_turns(
             if nu.get("sessionUpdate") != "user_message_chunk":
                 break
             c = nu.get("content") or {}
-            prompt_parts.append(c.get("text") if isinstance(c, dict) else "")
+            chunk = c.get("text") if isinstance(c, dict) else ""
+            prompt_parts.append(chunk or "")
             j += 1
         end = starts[k + 1][0] if k + 1 < len(starts) else len(rows)
         spans.append((start, end, "".join(prompt_parts)))
@@ -433,6 +434,21 @@ class _GrokBase:
             "turns": turns,
             **S.History(slug, sid, source=self.id).status(),
         }
+
+    def perform_delete_session(self, slug: str, sid: str) -> None:
+        import shutil
+
+        d = self._sess_dir(slug, sid)
+        files: dict[str, bytes] = {}
+        for p in sorted(d.rglob("*")):
+            if p.is_file():
+                try:
+                    rel = str(p.relative_to(d)).replace("\\", "/")
+                except ValueError:
+                    rel = p.name
+                files[rel.replace("/", "__")] = p.read_bytes()
+        S.archive_deleted_session(self.id, slug, sid, files)
+        shutil.rmtree(d)
 
     def perform_delete(
         self,

@@ -41,6 +41,9 @@ class ClaudeProvider:
     ) -> None:
         S.perform_delete(slug, sid, turn_ids, expected_hash, fold_synthetic=fold_synthetic)
 
+    def perform_delete_session(self, slug: str, sid: str) -> None:
+        S.perform_delete_session(slug, sid)
+
     def perform_undo(self, slug: str, sid: str, expected_hash: str) -> None:
         S.perform_undo(slug, sid, expected_hash)
 

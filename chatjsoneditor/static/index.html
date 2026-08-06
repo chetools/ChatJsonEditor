@@ -57,8 +57,15 @@
   .row .lbl { overflow: hidden; text-overflow: ellipsis; }
   .row.folder .lbl { color: var(--text2); }
   .row.project .lbl { color: var(--text); font-weight: 550; }
-  .row.session { color: var(--text2); }
+  .row.session { color: var(--text2); position: relative; padding-right: 28px; }
   .row.session .sub { color: var(--faint); font-size: 11.5px; margin-left: 6px; }
+  .row.session .sess-del {
+    position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+    display: none; background: none; border: 1px solid transparent; color: var(--faint);
+    cursor: pointer; font-size: 12px; border-radius: 5px; padding: 1px 5px; line-height: 1.2;
+  }
+  .row.session:hover .sess-del, .row.session:focus-within .sess-del { display: inline-block; }
+  .row.session .sess-del:hover { color: #f0a9a6; border-color: #6a3b39; }
   .row.source { color: var(--text); font-weight: 650; font-size: 13px; }
   .row.source .badge { font-size: 10.5px; color: var(--faint); font-weight: 500; margin-left: 6px; }
   .children { overflow: hidden; }
@@ -134,12 +141,17 @@
   .sumctl input { width: 44px; background: var(--card); color: var(--text); border: 1px solid var(--border2); border-radius: 5px; padding: 2px 5px; font: inherit; font-size: 12px; }
   #sumList { overflow-y: auto; flex: 1; padding: 2px 0 40px; }
   #sumList .placeholder { padding: 20px 12px; }
-  .sumitem { padding: 8px 12px 9px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .sumitem { padding: 8px 12px 9px; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; }
   .sumitem:hover { background: rgba(255,255,255,.04); }
   .sumitem.current { background: rgba(217,122,88,.13); box-shadow: inset 3px 0 0 var(--cur); }
+  .sumitem.selected { background: rgba(217,83,79,.09); }
+  .sumitem.selected.current { background: rgba(217,83,79,.14); box-shadow: inset 3px 0 0 var(--cur); }
   .sumitem .sh { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--faint); margin-bottom: 4px; }
   .sumitem .sh .idx { font-family: var(--mono); color: var(--dim); }
-  .sumitem .sh .mark { width: 8px; height: 8px; border-radius: 3px; border: 1.5px solid var(--border2); flex: none; }
+  .sumitem .sh .mark {
+    width: 14px; height: 14px; border-radius: 4px; border: 1.5px solid var(--border2); flex: none;
+    display: inline-flex; align-items: center; justify-content: center; font-size: 10px; color: #fff;
+  }
   .sumitem.selected .sh .mark { background: var(--danger); border-color: var(--danger); }
   .sumitem .u { color: var(--text2); font-size: 12.5px; line-height: 1.45; }
   .sumitem .a { color: var(--dim); font-size: 12px; line-height: 1.45; margin-top: 5px; padding-top: 5px; border-top: 1px dashed var(--border); }
@@ -195,18 +207,19 @@
   <div class="pane" id="summaryPane">
     <div class="pane-head">
       <span class="grow">Summary</span>
+      <button class="icon-btn" id="sumDelBtn" title="Delete selected turns" disabled style="display:none">Delete</button>
       <label class="sumctl" title="Lines of user text / reply to show per turn">lines <input type="number" id="sumLines" min="1" max="12" value="2"></label>
     </div>
     <div id="sumList"><div class="placeholder">Open a session to see its outline.</div></div>
   </div>
 </div>
 
-<!-- delete confirm -->
+<!-- delete confirm (turns or whole session) -->
 <div class="overlay" id="modalWrap">
   <div class="sheet" style="width:min(440px,90vw)">
-    <h2>Delete turns?</h2>
+    <h2 id="modalTitle">Delete turns?</h2>
     <p id="modalText"></p>
-    <p style="font-size:12.5px;color:var(--dim)">A snapshot is saved first — you can always undo.</p>
+    <p id="modalNote" style="font-size:12.5px;color:var(--dim)">A snapshot is saved first — you can always undo.</p>
     <div class="row-actions">
       <button class="btn" onclick="hideModal()">Cancel</button>
       <button class="btn danger" id="modalConfirm">Delete</button>
@@ -416,10 +429,26 @@ function renderNode(node, prefix, parent, depth, src) {
 }
 function renderSession(src, slug, s) {
   const row = document.createElement('div');
-  row.className = 'row session'; row.dataset.sid = s.sid;
+  row.className = 'row session';
+  row.dataset.sid = s.sid;
+  row.dataset.source = src.id;
+  row.dataset.slug = slug;
+  row.dataset.title = s.title || s.sid;
   const extra = s.model ? ` · ${esc(s.model)}` : '';
-  row.innerHTML = `<span class="disc"></span><span class="ico">📄</span><span class="lbl">${esc(s.title)}<span class="sub">${s.turnCount}t · ${fmtBytes(s.bytes)}${extra}</span></span>`;
-  row.onclick = (e) => { e.stopPropagation(); markActiveSession(row); openSession(src, slug, s.sid, s.title); };
+  row.innerHTML =
+    `<span class="disc"></span><span class="ico">📄</span>` +
+    `<span class="lbl">${esc(s.title)}<span class="sub">${s.turnCount}t · ${fmtBytes(s.bytes)}${extra}</span></span>` +
+    `<button type="button" class="sess-del" title="Delete entire session">✕</button>`;
+  row.onclick = (e) => {
+    if (e.target.closest('.sess-del')) return;
+    e.stopPropagation();
+    markActiveSession(row);
+    openSession(src, slug, s.sid, s.title);
+  };
+  row.querySelector('.sess-del').onclick = (e) => {
+    e.stopPropagation();
+    openDeleteSessionModal(src, slug, s.sid, s.title || s.sid, row);
+  };
   return row;
 }
 function markActiveSession(row) {
@@ -591,7 +620,12 @@ function syncSelectionStyles() {
     const box = el.querySelector('.turn-head .box'); if (box) box.textContent = on ? '✓' : '';
   });
   document.querySelectorAll('#sumList .sumitem').forEach((el, k) => {
-    const t = turns[k]; if (t) el.classList.toggle('selected', state.selected.has(t.id));
+    const t = turns[k];
+    if (!t) return;
+    const on = state.selected.has(t.id);
+    el.classList.toggle('selected', on);
+    const mark = el.querySelector('.sh .mark');
+    if (mark) mark.textContent = on ? '✓' : '';
   });
 }
 
@@ -604,14 +638,20 @@ function renderSummary() {
   if (!turns.length) { list.innerHTML = '<div class="placeholder">No turns in this session.</div>'; return; }
   turns.forEach((t, i) => {
     const item = document.createElement('div');
-    item.className = 'sumitem' + (state.selected.has(t.id) ? ' selected' : '');
+    const on = state.selected.has(t.id);
+    item.className = 'sumitem' + (on ? ' selected' : '');
     item.dataset.vis = i;
+    item.dataset.turnId = t.id;
     const u = sumUserText(t), a = sumReplyText(t);
     item.innerHTML =
-      `<div class="sh"><span class="mark"></span><span class="idx">#${i + 1}</span><span>${esc(fmtTime(t.timestamp))}</span></div>` +
+      `<div class="sh"><span class="mark">${on ? '✓' : ''}</span><span class="idx">#${i + 1}</span><span>${esc(fmtTime(t.timestamp))}</span></div>` +
       `<div class="u clamp">${u ? esc(u) : '<span class="muted">(no text)</span>'}</div>` +
       (a ? `<div class="a clamp">${esc(a)}</div>` : '');
-    item.onclick = () => setCurrent(i);
+    item.onclick = (e) => {
+      // click / shift-click selects; same model as the transcript pane
+      setCurrent(i);
+      toggleSelect(t.id, e.shiftKey);
+    };
     list.appendChild(item);
   });
   syncSummaryCurrent();
@@ -636,20 +676,80 @@ function updateToolbar() {
   $('#delBtn').disabled = !state.selected.size;
   $('#undoBtn').disabled = !sess.canUndo;
   $('#redoBtn').disabled = !sess.canRedo;
+  const sumDel = $('#sumDelBtn');
+  if (sumDel) {
+    const n = state.selected.size;
+    sumDel.style.display = n ? 'inline-block' : 'none';
+    sumDel.disabled = !n;
+    sumDel.textContent = n ? `Delete (${n})` : 'Delete';
+  }
 }
 
 /* ---------- delete / undo / redo ---------- */
+// modalMode: 'turns' | 'session'
+let modalMode = 'turns';
+let pendingSessionDelete = null; // { source, slug, sid, title, row }
+
 $('#delBtn').onclick = openDeleteModal;
+$('#sumDelBtn').onclick = openDeleteModal;
 function openDeleteModal() {
   if (!state.selected.size) return;
+  modalMode = 'turns';
+  pendingSessionDelete = null;
   const n = state.selected.size;
   const bytes = state.session.turns.filter(t => state.selected.has(t.id)).reduce((a,t)=>a+t.bytes,0);
+  $('#modalTitle').textContent = n === 1 ? 'Delete turn?' : 'Delete turns?';
   $('#modalText').textContent = `Remove ${n} turn${n===1?'':'s'} (${fmtBytes(bytes)}) from this session file.`;
+  $('#modalNote').textContent = 'A snapshot is saved first — you can always undo.';
   $('#modalWrap').classList.add('show');
 }
-function hideModal() { $('#modalWrap').classList.remove('show'); }
+function openDeleteSessionModal(src, slug, sid, title, row) {
+  modalMode = 'session';
+  pendingSessionDelete = { source: src.id, slug, sid, title, row, productName: src.productName || src.label };
+  $('#modalTitle').textContent = 'Delete entire session?';
+  $('#modalText').textContent =
+    `Permanently remove “${title}” from ${src.productName || src.label}. ` +
+    `This deletes the whole conversation file, not just individual turns.`;
+  $('#modalNote').textContent = 'A copy is archived under chatjsoneditor backups first. This cannot be undone from the app.';
+  $('#modalWrap').classList.add('show');
+}
+function hideModal() {
+  $('#modalWrap').classList.remove('show');
+  pendingSessionDelete = null;
+  modalMode = 'turns';
+}
 $('#modalWrap').onclick = (e) => { if (e.target.id === 'modalWrap') hideModal(); };
+function clearOpenSessionView() {
+  state.source = null; state.slug = null; state.sid = null;
+  state.title = null; state.session = null; state.productName = null;
+  state.selected = new Set(); state.lastClicked = null; state.current = -1;
+  $('#toolbar').style.display = 'none';
+  $('#banner').style.display = 'none';
+  $('#transcript').innerHTML = '<div class="conv-empty">Pick a session in the Explorer to view the conversation.</div>';
+  $('#sumList').innerHTML = '<div class="placeholder">Open a session to see its outline.</div>';
+  const sumDel = $('#sumDelBtn');
+  if (sumDel) { sumDel.style.display = 'none'; sumDel.disabled = true; }
+  document.querySelectorAll('#tree .row.session.active').forEach(x => x.classList.remove('active'));
+}
 $('#modalConfirm').onclick = async () => {
+  if (modalMode === 'session') {
+    const p = pendingSessionDelete;
+    hideModal();
+    if (!p) return;
+    try {
+      await api(
+        `/api/${p.source}/sessions/${encodeURIComponent(p.slug)}/${encodeURIComponent(p.sid)}`,
+        { method: 'DELETE' },
+      );
+      if (p.row && p.row.isConnected) p.row.remove();
+      const openMatch = state.source === p.source && state.slug === p.slug && state.sid === p.sid;
+      if (openMatch) clearOpenSessionView();
+      toast('Session deleted');
+    } catch (e) {
+      toast(e.message, false);
+    }
+    return;
+  }
   hideModal();
   try {
     const base = `/api/${state.source}/sessions/${encodeURIComponent(state.slug)}/${encodeURIComponent(state.sid)}`;

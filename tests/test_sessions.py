@@ -192,6 +192,17 @@ def test_stale_hash_conflict(env):
         S.perform_delete("C--test-Project", "sess1", ["u1"], "deadbeef")
 
 
+def test_delete_entire_session(env):
+    S, path = env
+    assert path.is_file()
+    S.perform_delete_session("C--test-Project", "sess1")
+    assert not path.is_file()
+    # archived under backups
+    archives = list((S.backups_root() / "claude" / "C--test-Project" / "sess1").glob("deleted-*"))
+    assert archives, "expected a deleted-* archive folder"
+    assert any(p.is_file() for p in archives[0].iterdir())
+
+
 def test_delete_all_turns_leaves_valid_file(env):
     S, path = env
     doc = S.load_session(path)

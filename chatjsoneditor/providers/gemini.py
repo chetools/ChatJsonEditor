@@ -311,6 +311,11 @@ class GeminiProvider:
             **S.History(slug, sid, source=self.id).status(),
         }
 
+    def perform_delete_session(self, slug: str, sid: str) -> None:
+        path = self._session_path(slug, sid)
+        S.archive_deleted_session(self.id, slug, sid, {path.name: path.read_bytes()})
+        path.unlink()
+
     def perform_delete(
         self,
         slug: str,

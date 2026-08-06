@@ -118,6 +118,32 @@ def test_grok_stale_hash(multi_env):
         g.perform_delete("proj", "sess1", ["x"], "deadbeef")
 
 
+def test_grok_delete_entire_session(multi_env):
+    g = multi_env["grok"]
+    sess_dir = multi_env["paths"]["grok"] / "proj" / "sess1"
+    assert sess_dir.is_dir()
+    g.perform_delete_session("proj", "sess1")
+    assert not sess_dir.exists()
+    assert g.list_sessions("proj") == []
+
+
+def test_gemini_delete_entire_session(multi_env):
+    gem = multi_env["gemini"]
+    sessions = gem.list_sessions("hash123")
+    assert sessions
+    sid = sessions[0]["sid"]
+    path = multi_env["paths"]["gemini"] / "hash123" / "chats" / sid
+    if not path.is_file():
+        # sid may be stem-only in some layouts
+        path = multi_env["paths"]["gemini"] / "hash123" / "chats" / (
+            sid if sid.endswith((".json", ".jsonl")) else f"{sid}.json"
+        )
+    assert path.is_file()
+    gem.perform_delete_session("hash123", sid)
+    assert not path.is_file()
+    assert gem.list_sessions("hash123") == []
+
+
 def test_gemini_list_load_delete(multi_env):
     gem = multi_env["gemini"]
     projects = gem.list_projects()

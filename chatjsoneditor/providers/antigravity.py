@@ -431,6 +431,24 @@ class AntigravityProvider:
             **S.History(slug, sid, source=self.id).status(),
         }
 
+    def perform_delete_session(self, slug: str, sid: str) -> None:
+        import shutil
+
+        db = self._resolve(slug, sid)
+        files: dict[str, bytes] = {db.name: db.read_bytes()}
+        tpath = _transcript_path(sid)
+        tfpath = _transcript_full_path(sid)
+        if tpath and tpath.is_file():
+            files[tpath.name] = tpath.read_bytes()
+        if tfpath and tfpath.is_file():
+            files[tfpath.name] = tfpath.read_bytes()
+        S.archive_deleted_session(self.id, slug, sid, files)
+        db.unlink()
+        # remove auxiliary brain tree for this conversation id
+        brain = _brain_dir() / S.safe_name(sid)
+        if brain.is_dir():
+            shutil.rmtree(brain, ignore_errors=True)
+
     def perform_delete(
         self,
         slug: str,

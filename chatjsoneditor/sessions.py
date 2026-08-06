@@ -799,3 +799,37 @@ def multi_file_hash(paths: list[Path]) -> str:
             h.update(p.read_bytes())
         h.update(b"\0")
     return h.hexdigest()
+
+
+def archive_deleted_session(
+    source: str, slug: str, sid: str, files: dict[str, bytes]
+) -> Path:
+    """Best-effort archive of a session being permanently deleted.
+
+    Writes under backups/{source}/{slug}/{sid}/deleted-YYYYMMDD-HHMMSS/.
+    Returns the archive directory (may be empty if files was empty).
+    """
+    import time
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = (
+        backups_root()
+        / safe_name(source)
+        / safe_name(slug)
+        / safe_name(sid)
+        / f"deleted-{stamp}"
+    )
+    dest.mkdir(parents=True, exist_ok=True)
+    for name, data in files.items():
+        # keep basenames only — archives are flat recovery dumps
+        (dest / Path(name).name).write_bytes(data)
+    return dest
+
+
+def perform_delete_session(slug: str, sid: str) -> None:
+    """Permanently remove a Claude Code session file (after archiving)."""
+    path = session_path(slug, sid)
+    if not path.is_file():
+        raise FileNotFoundError(f"no such session: {sid}")
+    archive_deleted_session("claude", slug, sid, {path.name: path.read_bytes()})
+    path.unlink()

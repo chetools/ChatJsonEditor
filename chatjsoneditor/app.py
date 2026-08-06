@@ -100,6 +100,19 @@ def delete_turns(source: str, slug: str, sid: str, body: DeleteBody):
     )
 
 
+@app.delete("/api/{source}/sessions/{slug}/{sid}")
+def delete_session(source: str, slug: str, sid: str):
+    """Permanently delete an entire session (archived under backups first)."""
+    p = _provider(source)
+    try:
+        p.perform_delete_session(slug, sid)
+    except FileNotFoundError:
+        raise HTTPException(404, "session file not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "source": source, "slug": slug, "sid": sid}
+
+
 @app.post("/api/{source}/sessions/{slug}/{sid}/undo")
 def undo(source: str, slug: str, sid: str, body: HashBody):
     p = _provider(source)
@@ -148,6 +161,11 @@ def legacy_session_detail(slug: str, sid: str, showAll: bool = False):
 @app.post("/api/sessions/{slug}/{sid}/delete")
 def legacy_delete(slug: str, sid: str, body: DeleteBody):
     return delete_turns("claude", slug, sid, body)
+
+
+@app.delete("/api/sessions/{slug}/{sid}")
+def legacy_delete_session(slug: str, sid: str):
+    return delete_session("claude", slug, sid)
 
 
 @app.post("/api/sessions/{slug}/{sid}/undo")
