@@ -83,6 +83,48 @@ def test_keybindings_defaults_and_merge(env):
         S.save_keybindings({"undo": ""})
 
 
+def test_corrupt_keybindings_fall_back_to_defaults(env, caplog):
+    S, _ = env
+    p = S.keybindings_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        assert S.load_keybindings() == S.DEFAULT_KEYBINDINGS
+    assert any("keybinding" in r.message for r in caplog.records)
+
+
+def test_corrupt_history_state_is_quarantined(env, caplog):
+    S, path = env
+    S.perform_delete("C--test-Project", "sess1", ["u3"], S.file_hash(path))
+    h = S.History("C--test-Project", "sess1")
+    snapshots = sorted(p.name for p in h.dir.iterdir() if p.name != "state.json")
+    h.state_path.write_text("{oops", encoding="utf-8")
+
+    with caplog.at_level("ERROR"):
+        assert h.status() == {"canUndo": False, "canRedo": False}
+    assert h.state_path.with_suffix(".json.corrupt").is_file()
+    # existing snapshots survive and are not overwritten by the next one
+    h.record_and_write(path, path.read_text(encoding="utf-8"))
+    for name in snapshots:
+        assert (h.dir / name).is_file()
+    new_state = json.loads(h.state_path.read_text(encoding="utf-8"))
+    assert new_state["undo"][-1] not in snapshots
+
+
+def test_missing_snapshot_leaves_history_intact(env):
+    S, path = env
+    S.perform_delete("C--test-Project", "sess1", ["u3"], S.file_hash(path))
+    h = S.History("C--test-Project", "sess1")
+    state = json.loads(h.state_path.read_text(encoding="utf-8"))
+    (h.dir / state["undo"][-1]).unlink()
+    deleted = path.read_bytes()
+
+    with pytest.raises(ValueError):
+        S.perform_undo("C--test-Project", "sess1", S.file_hash(path))
+    assert path.read_bytes() == deleted
+    assert json.loads(h.state_path.read_text(encoding="utf-8"))["undo"] == state["undo"]
+
+
 def test_turn_messages_shape_and_pairing(env):
     S, path = env
     doc = S.load_session(path)

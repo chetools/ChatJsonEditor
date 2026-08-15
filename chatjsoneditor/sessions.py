@@ -11,13 +11,20 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote
 
 from . import jsonio
+
+log = logging.getLogger(__name__)
+
+# Providers reach for it as S.CorruptDataError; it lives with the readers that raise it.
+CorruptDataError = jsonio.CorruptDataError
 
 HEADER_TURN_ID = "__header__"
 
@@ -95,9 +102,22 @@ def keybindings_path() -> Path:
 def load_keybindings() -> dict[str, str]:
     """Defaults merged with the on-disk overrides (unknown actions ignored)."""
     result = dict(DEFAULT_KEYBINDINGS)
-    for action, combo in jsonio.read_json(keybindings_path()).items():
-        if action in DEFAULT_KEYBINDINGS and isinstance(combo, str) and combo:
-            result[action] = combo
+    p = keybindings_path()
+    if p.is_file():
+        try:
+            saved = json.loads(jsonio.read_text(p))
+        except (json.JSONDecodeError, OSError, CorruptDataError):
+            log.warning("ignoring unreadable keybindings file %s; using defaults", p,
+                        exc_info=True)
+            return result
+        if not isinstance(saved, dict):
+            log.warning("keybindings file %s is not an object; using defaults", p)
+            return result
+        for action, combo in saved.items():
+            if action in DEFAULT_KEYBINDINGS and isinstance(combo, str) and combo:
+                result[action] = combo
+            else:
+                log.warning("ignoring invalid keybinding %r=%r in %s", action, combo, p)
     return result
 
 
@@ -119,7 +139,16 @@ def save_keybindings(mapping: dict) -> dict[str, str]:
 
 
 def safe_name(name: str) -> str:
-    if not _NAME_RE.match(name) or ".." in name:
+    """Validate a single on-disk path component supplied by a client.
+
+    Percent-encoded separators are legitimate inside Grok's slugs (a whole cwd
+    encoded into one directory name), so they stay allowed, but the decoded
+    form must not smuggle traversal segments past a later ``unquote``.
+    """
+    if not name or not _NAME_RE.match(name) or ".." in name:
+        raise ValueError(f"unsafe path component: {name!r}")
+    decoded = unquote(name)
+    if ".." in decoded or "\x00" in decoded:
         raise ValueError(f"unsafe path component: {name!r}")
     return name
 
@@ -186,14 +215,18 @@ def atomic_write(path: Path, text: str) -> None:
             f.write(text)
         os.replace(tmp, path)
     except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        _cleanup_temp(tmp)
         raise
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
+def _cleanup_temp(tmp: str) -> None:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        log.warning("could not remove temp file %s", tmp, exc_info=True)
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
     """Atomic-ish binary write; falls back to in-place rewrite on Windows locks."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
@@ -207,15 +240,9 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             # Destination may be briefly locked (e.g. SQLite on Windows).
             with open(path, "wb") as f:
                 f.write(data)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            _cleanup_temp(tmp)
     except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        _cleanup_temp(tmp)
         raise
 
 
@@ -506,7 +533,11 @@ def list_projects() -> list[dict]:
     for d in sorted(root.iterdir()):
         if not d.is_dir():
             continue
-        count = len(list(d.glob("*.jsonl")))
+        try:
+            count = len(list(d.glob("*.jsonl")))
+        except OSError:
+            log.warning("skipping unreadable project directory %s", d, exc_info=True)
+            continue
         if count == 0:
             continue
         out.append({"slug": d.name, "label": decode_slug(d.name), "sessionCount": count})
@@ -533,9 +564,14 @@ def list_sessions(slug: str) -> list[dict]:
                     if is_human_prompt(e.data):
                         title = _preview(_text_of_blocks((e.data.get("message") or {}).get("content")), 80)
                         break
-        except (OSError, UnicodeDecodeError):
+        except (OSError, CorruptDataError):
+            log.warning("could not read session %s", p, exc_info=True)
             title = "(unreadable)"
-        stat = p.stat()
+        try:
+            stat = p.stat()
+        except OSError:
+            log.warning("session %s vanished while listing", p, exc_info=True)
+            continue
         out.append({
             "sid": p.stem,
             "title": title or "(untitled)",
@@ -562,14 +598,57 @@ class History:
         self.dir = backups_root() / safe_name(source) / safe_name(slug) / safe_name(sid)
         self.state_path = self.dir / "state.json"
 
+    def _fresh_state(self) -> dict:
+        """Empty stacks, with the counter past any snapshot already on disk.
+
+        Restarting the counter at 0 would make the next snapshot overwrite an
+        existing one, so recovery from a lost state file must not lose backups.
+        """
+        counter = 0
+        if self.dir.is_dir():
+            for p in self.dir.iterdir():
+                stem = p.name.split(".")[0]
+                if stem.isdigit():
+                    counter = max(counter, int(stem))
+        return {"undo": [], "redo": [], "counter": counter}
+
     def _load(self) -> dict:
-        return jsonio.read_json(
-            self.state_path, {"undo": [], "redo": [], "counter": 0}
-        )
+        if not self.state_path.is_file():
+            return self._fresh_state()
+        try:
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            log.error("unreadable undo history %s; starting a new history",
+                      self.state_path, exc_info=True)
+            self._quarantine_state()
+            return self._fresh_state()
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("undo"), list)
+            or not isinstance(state.get("redo"), list)
+            or not isinstance(state.get("counter"), int)
+        ):
+            log.error("malformed undo history %s; starting a new history", self.state_path)
+            self._quarantine_state()
+            return self._fresh_state()
+        return state
+
+    def _quarantine_state(self) -> None:
+        """Move a damaged state file aside so snapshots stay recoverable."""
+        try:
+            self.state_path.replace(self.state_path.with_suffix(".json.corrupt"))
+        except OSError:
+            log.warning("could not set aside %s", self.state_path, exc_info=True)
 
     def _save(self, state: dict) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        atomic_write(self.state_path, json.dumps(state))
+
+    def _read_snapshot(self, name: str) -> bytes:
+        snap = self.dir / name
+        if not snap.is_file():
+            raise ValueError(f"missing snapshot: {name}")
+        return snap.read_bytes()
 
     def _snapshot_bytes(self, state: dict, content: bytes, suffix: str = ".jsonl") -> str:
         state["counter"] += 1
@@ -610,7 +689,7 @@ class History:
         name = self._snapshot_bytes(state, path.read_bytes(), suffix=".bin")
         state["undo"].append(name)
         state["redo"] = []
-        atomic_write_bytes(path, new_bytes)
+        _atomic_write_bytes(path, new_bytes)
         self._save(state)
 
     def record_and_write_bundle(
@@ -628,7 +707,7 @@ class History:
             if isinstance(data, str):
                 atomic_write(p, data)
             else:
-                atomic_write_bytes(p, data)
+                _atomic_write_bytes(p, data)
         self._save(state)
 
     def _step(self, path: Path, from_stack: str, to_stack: str) -> None:
@@ -637,14 +716,11 @@ class History:
         if not state[from_stack]:
             raise ValueError(f"nothing to {from_stack}")
         current = self._snapshot_bytes(state, path.read_bytes())
-        name = state[from_stack].pop()
-        restored = (self.dir / name).read_bytes()
+        name = state[from_stack][-1]
+        restored = self._read_snapshot(name)
+        state[from_stack].pop()
         state[to_stack].append(current)
-        # binary-safe when snapshot is .bin; text otherwise
-        if name.endswith(".bin"):
-            atomic_write_bytes(path, restored)
-        else:
-            atomic_write(path, restored.decode("utf-8"))
+        _atomic_write_bytes(path, restored)
         self._save(state)
 
     def _step_bundle(
@@ -656,14 +732,17 @@ class History:
             raise ValueError(f"nothing to {from_stack}")
         current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
         cur_name = self._snapshot_bundle(state, current)
-        name = state[from_stack].pop()
+        name = state[from_stack][-1]
         restored = self._read_bundle(name)
+        state[from_stack].pop()
         state[to_stack].append(cur_name)
         for rel, data in restored.items():
             p = paths.get(rel)
             if p is None:
+                log.warning("snapshot %s holds %r which is not part of this session",
+                            name, rel)
                 continue
-            atomic_write_bytes(p, data)
+            _atomic_write_bytes(p, data)
         self._save(state)
 
     def undo(self, path: Path) -> None:

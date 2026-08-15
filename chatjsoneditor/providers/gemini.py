@@ -6,6 +6,7 @@ Format varies across CLI versions; this adapter is intentionally tolerant.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from .. import jsonio
@@ -21,6 +22,8 @@ from .common import (
     text_from_content,
     turn_spans,
 )
+
+log = logging.getLogger(__name__)
 
 
 def _root() -> Path:
@@ -58,12 +61,27 @@ def _project_label(project_hash: str) -> str:
         if p.is_file():
             try:
                 text = p.read_text(encoding="utf-8").strip()
-                if text:
-                    return text.splitlines()[0].strip()
-            except OSError:
-                pass
+            except (OSError, UnicodeDecodeError):
+                log.warning("could not read project marker %s", p, exc_info=True)
+                continue
+            if text:
+                return text.splitlines()[0].strip()
     short = project_hash[:12] + "…" if len(project_hash) > 12 else project_hash
     return f"project {short}"
+
+
+def _only_messages(path: Path, items: list) -> list[dict]:
+    """Message objects, refusing a transcript that also holds other values.
+
+    Anything dropped here would be lost the next time the file is rewritten.
+    """
+    messages = [m for m in items if isinstance(m, dict)]
+    if len(messages) != len(items):
+        raise S.CorruptDataError(
+            f"{path.name} contains {len(items) - len(messages)} entr(ies) that are "
+            "not messages; repair the file before editing this session"
+        )
+    return messages
 
 
 def _load_messages(path: Path) -> tuple[list[dict], dict]:
@@ -73,9 +91,14 @@ def _load_messages(path: Path) -> tuple[list[dict], dict]:
         not text.lstrip().startswith("{") and not text.lstrip().startswith("[")
     ):
         messages = []
-        for line in text.splitlines():
-            obj = jsonio.parse_object(line.strip())
+        skipped = 0
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            obj = jsonio.parse_object(line)
             if obj is None:
+                skipped += 1
                 continue
             # unwrap {"message": {...}} envelopes; otherwise take the line as-is
             if (
@@ -84,21 +107,31 @@ def _load_messages(path: Path) -> tuple[list[dict], dict]:
             ):
                 obj = obj["message"]
             messages.append(obj)
+        if skipped:
+            # unparseable lines are dropped on rewrite, so never do it silently
+            raise S.CorruptDataError(
+                f"{path.name} has {skipped} unparseable or non-message line(s); "
+                "repair the file before editing this session"
+            )
         return messages, {"format": "jsonl"}
 
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
-        return [], {"format": "broken"}
+    except json.JSONDecodeError as e:
+        # Returning "no messages" here made a delete rewrite the file as an
+        # empty transcript, destroying a session we simply could not read.
+        raise S.CorruptDataError(f"{path.name} is not valid JSON: {e}") from e
 
     if isinstance(data, list):
-        return [m for m in data if isinstance(m, dict)], {"format": "list"}
+        return _only_messages(path, data), {"format": "list"}
     if not isinstance(data, dict):
-        return [], {"format": "unknown"}
+        raise S.CorruptDataError(
+            f"{path.name} holds a {type(data).__name__}, not a session transcript"
+        )
 
     for key in ("messages", "history", "chat", "items"):
         if isinstance(data.get(key), list):
-            return [m for m in data[key] if isinstance(m, dict)], data
+            return _only_messages(path, data[key]), data
     # single message object
     if "role" in data or "parts" in data:
         return [data], data
@@ -248,9 +281,9 @@ class GeminiProvider:
         ]
 
     def _session_path(self, slug: str, sid: str) -> Path:
-        S.safe_name(slug)
         # sid is the file stem or full filename
         root = _root() / S.safe_name(slug)
+        sid = S.safe_name(sid)
         candidates = [
             root / "chats" / sid,
             root / "chats" / f"{sid}.json",
@@ -275,7 +308,11 @@ class GeminiProvider:
         for ph, path in _iter_session_files():
             if ph != slug:
                 continue
-            messages, _ = _load_messages(path)
+            try:
+                messages, _ = _load_messages(path)
+            except (S.CorruptDataError, OSError):
+                log.warning("listing %s without turn counts", path, exc_info=True)
+                messages = []
             turns = _group_turns(messages)
             turn_count = sum(1 for t in turns if t.deletable)
             st = path.stat()

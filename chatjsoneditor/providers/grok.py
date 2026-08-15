@@ -7,7 +7,9 @@ model_id heuristics (Grok Build wins on overlap).
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -29,6 +31,8 @@ from .common import (
     total_bytes,
     turn_spans,
 )
+
+log = logging.getLogger(__name__)
 
 # Identity files hashed + snapshotted for edit safety.
 _IDENTITY = ("updates.jsonl", "chat_history.jsonl", "summary.json")
@@ -65,7 +69,7 @@ def _session_dirs(root: Path) -> list[tuple[str, Path, dict]]:
             summary_path = sess / "summary.json"
             if not summary_path.is_file():
                 continue
-            out.append((proj.name, sess, jsonio.read_json(summary_path)))
+            out.append((proj.name, sess, jsonio.read_json_or_default(summary_path)))
     return out
 
 
@@ -73,11 +77,7 @@ def _cwd_label(slug: str, summary: dict) -> str:
     cwd = (summary.get("info") or {}).get("cwd")
     if cwd:
         return cwd
-    # URL-encoded path slug
-    try:
-        return unquote(slug)
-    except Exception:
-        return slug
+    return unquote(slug)
 
 
 def _identity_paths(sess_dir: Path) -> dict[str, Path]:
@@ -201,10 +201,15 @@ def _group_chat_turns(
 
 
 def _chat_turn_id(rows: list[tuple[str, dict | None]], start: int) -> str:
-    """Stable-ish turn id from the prompt position + a hash of its first chars."""
+    """Turn id from the prompt position plus a digest of its first characters.
+
+    sha256 rather than hash(): PYTHONHASHSEED randomizes hash() per run, which
+    would invalidate every turn id the client is holding.
+    """
     text = _chat_user_text(rows[start][1] or {})
     q = extract_user_query(text) or text
-    return f"u{start}-{abs(hash(q[:80])) % 10**8}"
+    digest = hashlib.sha256(q[:80].encode("utf-8")).hexdigest()[:8]
+    return f"u{start}-{digest}"
 
 
 def _group_update_turns(
@@ -325,7 +330,7 @@ class _GrokBase:
         if not d.is_dir():
             raise FileNotFoundError(f"no such session: {sid}")
         # verify classification
-        is_build = _is_build_session(jsonio.read_json(d / "summary.json"))
+        is_build = _is_build_session(jsonio.read_json_or_default(d / "summary.json"))
         if self.build_only and not is_build:
             raise FileNotFoundError(f"session {sid} is not a Grok Build session")
         if not self.build_only and is_build:
@@ -402,12 +407,20 @@ class _GrokBase:
         # Which ordered prompt indices are being deleted?
         ordered_ids = _real_prompt_orders(chat_rows, fold_synthetic)
         deleted_orders = {i for i, tid in enumerate(ordered_ids) if tid in turn_ids}
+        # Deleting by prompt order is what keeps updates.jsonl aligned with
+        # chat_history.jsonl, so a turn id that resolves to no order (or to
+        # several) would silently trim the wrong span of updates.
+        if len(deleted_orders) != len(set(turn_ids) & set(ordered_ids)):
+            raise ValueError(
+                "ambiguous turn ids: cannot map the selection onto prompt order; "
+                "reload the session and retry"
+            )
 
         new_chat = _delete_chat_turns(chat_rows, turn_ids, fold_synthetic)
         updates_rows = jsonio.load_rows(updates_path)
         new_updates = _delete_update_turns_by_order(updates_rows, deleted_orders)
 
-        summary = jsonio.read_json(summary_path)
+        summary = jsonio.read_json_or_default(summary_path)
         summary["num_chat_messages"] = len(new_chat)
         summary["num_messages"] = len(new_updates)
 

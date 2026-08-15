@@ -2,13 +2,22 @@
 
 All sources store transcripts as JSONL (or JSON) files written by another
 program, so parsing must never raise on a malformed line and rewriting must
-preserve untouched lines byte-for-byte.
+preserve untouched lines byte-for-byte. Whole-file damage is different: a file
+that is not even UTF-8 cannot be edited without destroying content, so reading
+it raises `CorruptDataError`.
 """
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+
+class CorruptDataError(Exception):
+    """On-disk data could not be parsed, so editing it would destroy content."""
 
 
 def split_lines(text: str) -> tuple[list[str], bool]:
@@ -36,7 +45,10 @@ def parse_object(line: str) -> dict | None:
 
 def read_text(path: Path) -> str:
     """Read a file as UTF-8 without newline translation (exact round-trip)."""
-    return path.read_bytes().decode("utf-8")
+    try:
+        return path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise CorruptDataError(f"{path.name} is not valid UTF-8: {e}") from e
 
 
 def load_rows(path: Path) -> list[tuple[str, dict | None]]:
@@ -48,29 +60,38 @@ def load_rows(path: Path) -> list[tuple[str, dict | None]]:
 
 
 def load_objects(path: Path) -> list[dict]:
-    """Parsed objects only, skipping blank and unparseable lines."""
+    """Parsed objects only; blank lines are ignored and damaged lines logged."""
     if not path.is_file():
         return []
     out = []
+    skipped = 0
     for line in read_text(path).splitlines():
         if not line.strip():
             continue
         obj = parse_object(line)
-        if obj is not None:
-            out.append(obj)
+        if obj is None:
+            skipped += 1
+            continue
+        out.append(obj)
+    if skipped:
+        log.warning("%s: %d unreadable line(s) not rendered", path, skipped)
     return out
 
 
-def read_json(path: Path, default: dict | None = None) -> dict:
-    """Read a JSON object, falling back to `default` on missing/broken files."""
+def read_json_or_default(path: Path, default: dict | None = None) -> dict:
+    """A JSON object read for display only: damage is logged, never raised."""
     fallback = {} if default is None else default
     if not path.is_file():
         return fallback
     try:
         data = json.loads(read_text(path))
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+    except (json.JSONDecodeError, OSError, CorruptDataError):
+        log.warning("ignoring unreadable %s", path, exc_info=True)
         return fallback
-    return data if isinstance(data, dict) else fallback
+    if not isinstance(data, dict):
+        log.warning("ignoring %s: expected an object, got %s", path, type(data).__name__)
+        return fallback
+    return data
 
 
 def dump_json(data, indent: int = 2) -> bytes:

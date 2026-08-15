@@ -6,8 +6,12 @@ protobuf step payloads). Readable parallel log under brain/<uuid>/…/transcript
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
+import shutil
 import sqlite3
+import tempfile
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -22,6 +26,8 @@ from .common import (
     group_projects,
     session_payload,
 )
+
+log = logging.getLogger(__name__)
 
 # Verified correlation: step_type 14 ↔ USER_INPUT in transcript.
 STEP_USER_INPUT = 14
@@ -48,7 +54,7 @@ def _config_projects() -> dict[str, str]:
     for p in cfg.glob("*.json"):
         if p.name == "outside-of-project.json":
             continue
-        data = jsonio.read_json(p)
+        data = jsonio.read_json_or_default(p)
         if not data:
             continue
         name = data.get("name") or p.stem
@@ -76,26 +82,20 @@ def _cwd_from_db(db_path: Path) -> str | None:
         finally:
             con.close()
     except sqlite3.Error:
+        log.warning("could not read project path from %s", db_path, exc_info=True)
         return None
     if not row or not row[0]:
         return None
     blob = row[0] if isinstance(row[0], (bytes, memoryview)) else bytes(row[0])
-    texts = re.findall(rb"file://[^\x00-\x1f]{5,300}", bytes(blob))
-    for t in texts:
-        try:
-            uri = t.decode("utf-8", "replace")
-            path = unquote(urlparse(uri).path)
-            if re.match(r"^/[A-Za-z]:", path):
-                path = path[1:]
-            return path
-        except Exception:
-            continue
+    for t in re.findall(rb"file://[^\x00-\x1f]{5,300}", bytes(blob)):
+        uri = t.decode("utf-8", "replace")
+        path = unquote(urlparse(uri).path)
+        if re.match(r"^/[A-Za-z]:", path):
+            path = path[1:]
+        return path
     # printable path-like strings
     for s in re.findall(rb"[A-Za-z]:[\\/][^\x00-\x1f]{3,200}", bytes(blob)):
-        try:
-            return s.decode("utf-8", "replace")
-        except Exception:
-            pass
+        return s.decode("utf-8", "replace")
     return None
 
 
@@ -360,18 +360,20 @@ class AntigravityProvider:
             try:
                 turns = _build_turns(sid, db, True)
                 turn_count = sum(1 for t in turns if t.deletable)
-            except Exception:
+            except (S.ConflictError, S.CorruptDataError, OSError, sqlite3.Error):
+                log.warning("listing %s without turn counts", db, exc_info=True)
                 turn_count = 0
             title = first_prompt_title(turns, sid)
             # try task.md / brain
             task = _brain_dir() / sid / "task.md"
             if task.is_file():
                 try:
-                    first = task.read_text(encoding="utf-8").strip().splitlines()[0]
-                    if first:
-                        title = first[:80]
-                except OSError:
-                    pass
+                    lines = task.read_text(encoding="utf-8").strip().splitlines()
+                except (OSError, UnicodeDecodeError):
+                    log.warning("could not read %s", task, exc_info=True)
+                    lines = []
+                if lines and lines[0]:
+                    title = lines[0][:80]
             out.append({
                 "sid": sid,
                 "slug": slug,
@@ -390,10 +392,7 @@ class AntigravityProvider:
         )
 
     def list_sessions(self, slug: str) -> list[dict]:
-        S.safe_name(slug) if re.match(r"^[A-Za-z0-9._%-]+$", slug) else slug
-        # validate
-        if ".." in slug:
-            raise ValueError(f"unsafe path component: {slug!r}")
+        S.safe_name(slug)
         out = []
         for s in self._all_sessions():
             if s["slug"] != slug:
@@ -409,17 +408,15 @@ class AntigravityProvider:
         return out
 
     def _resolve(self, slug: str, sid: str) -> Path:
-        # ensure sid belongs to slug
+        # The conversation id alone identifies the database; the slug is a
+        # display grouping derived from the cwd, so a mismatch (renamed or
+        # moved project) is logged rather than treated as a missing session.
         db = _db_path(sid)
         if not db.is_file():
             raise FileNotFoundError(f"no such session: {sid}")
-        # optional slug check
         for s in self._all_sessions():
-            if s["sid"] == sid:
-                if s["slug"] != slug:
-                    # still allow if slug mismatch due to label changes
-                    pass
-                return db
+            if s["sid"] == sid and s["slug"] != slug:
+                log.info("session %s is now grouped under %r, not %r", sid, s["slug"], slug)
         return db
 
     def session_payload(self, slug: str, sid: str, fold_synthetic: bool = True) -> dict:
@@ -433,8 +430,6 @@ class AntigravityProvider:
         )
 
     def perform_delete_session(self, slug: str, sid: str) -> None:
-        import shutil
-
         db = self._resolve(slug, sid)
         files = {p.name: p.read_bytes() for p in _bundle_paths(sid, db).values()}
         S.archive_deleted_session(self.id, slug, sid, files)
@@ -443,6 +438,9 @@ class AntigravityProvider:
         brain = _brain_dir() / S.safe_name(sid)
         if brain.is_dir():
             shutil.rmtree(brain, ignore_errors=True)
+            if brain.exists():
+                # the conversation itself is gone; leftovers are reported, not fatal
+                log.warning("could not fully remove auxiliary data at %s", brain)
 
     def perform_delete(
         self,
@@ -471,10 +469,6 @@ class AntigravityProvider:
                     del_idxs.add(r["idx"])
 
         # Perform deletion in a temp copy then replace
-        import shutil
-        import tempfile
-        import os
-
         parent = db.parent
         fd, tmp_db = tempfile.mkstemp(dir=str(parent), prefix=db.name + ".", suffix=".tmp")
         os.close(fd)
@@ -483,13 +477,19 @@ class AntigravityProvider:
             con = sqlite3.connect(tmp_db, timeout=5.0)
             try:
                 con.execute("BEGIN IMMEDIATE")
+                has_gen_metadata = con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gen_metadata'"
+                ).fetchone() is not None
                 for idx in sorted(del_idxs):
                     con.execute("DELETE FROM steps WHERE idx = ?", (idx,))
-                    try:
+                    if has_gen_metadata:
                         con.execute("DELETE FROM gen_metadata WHERE idx = ?", (idx,))
-                    except sqlite3.Error:
-                        pass
                 con.commit()
+            except sqlite3.Error as e:
+                con.rollback()
+                raise S.ConflictError(
+                    f"Could not edit the Antigravity database (locked or corrupt): {e}"
+                ) from e
             finally:
                 con.close()
 
@@ -503,7 +503,7 @@ class AntigravityProvider:
             try:
                 os.unlink(tmp_db)
             except OSError:
-                pass
+                log.warning("could not remove temp file %s", tmp_db, exc_info=True)
 
     def _guarded_bundle(self, slug: str, sid: str, expected_hash: str) -> dict[str, Path]:
         """Hash-guarded snapshot bundle for undo/redo."""
