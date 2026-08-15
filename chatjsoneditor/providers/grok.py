@@ -7,9 +7,9 @@ model_id heuristics (Grok Build wins on overlap).
 """
 from __future__ import annotations
 
+import hashlib
 import json
-import re
-from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -24,6 +24,8 @@ from .common import (
     is_grok_synthetic_user,
     text_from_content,
 )
+
+log = logging.getLogger(__name__)
 
 # Identity files hashed + snapshotted for edit safety.
 _IDENTITY = ("updates.jsonl", "chat_history.jsonl", "summary.json")
@@ -60,23 +62,31 @@ def _session_dirs(root: Path) -> list[tuple[str, Path, dict]]:
             summary_path = sess / "summary.json"
             if not summary_path.is_file():
                 continue
-            try:
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                summary = {}
+            summary = _read_summary(summary_path)
             out.append((proj.name, sess, summary))
     return out
+
+
+def _read_summary(path: Path) -> dict:
+    """summary.json contents, or {} if it is missing/damaged (display only)."""
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        log.warning("ignoring unreadable %s", path, exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        log.warning("ignoring %s: expected an object, got %s", path, type(data).__name__)
+        return {}
+    return data
 
 
 def _cwd_label(slug: str, summary: dict) -> str:
     cwd = (summary.get("info") or {}).get("cwd")
     if cwd:
         return cwd
-    # URL-encoded path slug
-    try:
-        return unquote(slug)
-    except Exception:
-        return slug
+    return unquote(slug)
 
 
 def _identity_paths(sess_dir: Path) -> dict[str, Path]:
@@ -90,7 +100,10 @@ def _hash_session(sess_dir: Path) -> str:
 def _load_jsonl(path: Path) -> list[tuple[str, dict | None]]:
     if not path.is_file():
         return []
-    text = path.read_bytes().decode("utf-8")
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise S.CorruptDataError(f"{path.name} is not valid UTF-8: {e}") from e
     trailing = text.endswith("\n")
     body = text[:-1] if trailing else text
     rows = []
@@ -231,9 +244,10 @@ def _group_chat_turns(
         data = rows[start][1] or {}
         text = _chat_user_text(data)
         q = extract_user_query(text) or text
-        tid = f"chat-{start}"
-        # stable-ish id from content hash of first 80 chars
-        tid = f"u{start}-{abs(hash(q[:80])) % 10**8}"
+        # stable across processes: PYTHONHASHSEED randomizes hash() per run,
+        # which would invalidate every turn id the client is holding
+        digest = hashlib.sha256(q[:80].encode("utf-8")).hexdigest()[:8]
+        tid = f"u{start}-{digest}"
         msgs = _messages_from_chat_span(rows, start, end)
         turns.append((Turn(tid, start, end, True), msgs))
     return turns
@@ -369,13 +383,7 @@ class _GrokBase:
         if not d.is_dir():
             raise FileNotFoundError(f"no such session: {sid}")
         # verify classification
-        summary_path = d / "summary.json"
-        summary = {}
-        if summary_path.is_file():
-            try:
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
+        summary = _read_summary(d / "summary.json")
         is_build = _is_build_session(summary)
         if self.build_only and not is_build:
             raise FileNotFoundError(f"session {sid} is not a Grok Build session")
@@ -469,21 +477,21 @@ class _GrokBase:
         # Which ordered prompt indices are being deleted?
         ordered_ids = _real_prompt_orders(chat_rows, fold_synthetic)
         deleted_orders = {i for i, tid in enumerate(ordered_ids) if tid in turn_ids}
+        # Deleting by prompt order is what keeps updates.jsonl aligned with
+        # chat_history.jsonl, so a turn id that resolves to no order (or to
+        # several) would silently trim the wrong span of updates.
         if len(deleted_orders) != len(set(turn_ids) & set(ordered_ids)):
-            # still call delete for validation
-            pass
+            raise ValueError(
+                "ambiguous turn ids: cannot map the selection onto prompt order; "
+                "reload the session and retry"
+            )
 
         new_chat = _delete_chat_turns(chat_rows, turn_ids, fold_synthetic)
         updates_rows = _load_jsonl(updates_path)
         new_updates = _delete_update_turns_by_order(updates_rows, deleted_orders)
 
         # summary patch
-        summary = {}
-        if summary_path.is_file():
-            try:
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                summary = {}
+        summary = _read_summary(summary_path)
         summary["num_chat_messages"] = len(new_chat)
         summary["num_messages"] = len(new_updates)
         summary_bytes = (json.dumps(summary, ensure_ascii=False, indent=2) + "\n").encode("utf-8")

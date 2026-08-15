@@ -2,21 +2,59 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import threading
 import webbrowser
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import sessions as S
 from .providers import get_provider, list_sources
 
+log = logging.getLogger(__name__)
+
 app = FastAPI(title="ChatJsonEditor")
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+# Errors raised anywhere below (routes, providers, sessions) are mapped to a
+# status code here instead of being caught and reworded per route, so no
+# failure reaches the client as an opaque 500 with an empty body.
+
+def _error(status: int, detail: str) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"detail": detail})
+
+
+@app.exception_handler(S.ConflictError)
+def _conflict_handler(request: Request, exc: S.ConflictError) -> JSONResponse:
+    return _error(409, str(exc))
+
+
+@app.exception_handler(S.CorruptDataError)
+def _corrupt_handler(request: Request, exc: S.CorruptDataError) -> JSONResponse:
+    log.warning("%s %s: unparseable session data: %s", request.method, request.url.path, exc)
+    return _error(422, str(exc))
+
+
+@app.exception_handler(FileNotFoundError)
+def _not_found_handler(request: Request, exc: FileNotFoundError) -> JSONResponse:
+    return _error(404, str(exc) or "not found")
+
+
+@app.exception_handler(ValueError)
+def _value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
+    return _error(400, str(exc))
+
+
+@app.exception_handler(OSError)
+def _os_error_handler(request: Request, exc: OSError) -> JSONResponse:
+    log.exception("%s %s failed", request.method, request.url.path)
+    return _error(500, f"filesystem error: {exc}")
 
 
 @app.get("/")
@@ -33,10 +71,7 @@ def sources():
 
 
 def _provider(source: str):
-    try:
-        return get_provider(source)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    return get_provider(source)
 
 
 @app.get("/api/{source}/projects")
@@ -46,22 +81,12 @@ def projects(source: str):
 
 @app.get("/api/{source}/projects/{slug}/sessions")
 def project_sessions(source: str, slug: str):
-    try:
-        return _provider(source).list_sessions(slug)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    return _provider(source).list_sessions(slug)
 
 
 @app.get("/api/{source}/sessions/{slug}/{sid}")
 def session_detail(source: str, slug: str, sid: str, showAll: bool = False):
-    try:
-        return _provider(source).session_payload(slug, sid, fold_synthetic=not showAll)
-    except FileNotFoundError as e:
-        raise HTTPException(404, str(e))
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except S.ConflictError as e:
-        raise HTTPException(409, str(e))
+    return _provider(source).session_payload(slug, sid, fold_synthetic=not showAll)
 
 
 class DeleteBody(BaseModel):
@@ -76,14 +101,7 @@ class HashBody(BaseModel):
 
 
 def _mutate(source: str, slug: str, sid: str, fn, fold_synthetic: bool = True):
-    try:
-        fn()
-    except S.ConflictError as e:
-        raise HTTPException(409, str(e))
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except FileNotFoundError:
-        raise HTTPException(404, "session file not found")
+    fn()
     return _provider(source).session_payload(slug, sid, fold_synthetic=fold_synthetic)
 
 
@@ -103,13 +121,7 @@ def delete_turns(source: str, slug: str, sid: str, body: DeleteBody):
 @app.delete("/api/{source}/sessions/{slug}/{sid}")
 def delete_session(source: str, slug: str, sid: str):
     """Permanently delete an entire session (archived under backups first)."""
-    p = _provider(source)
-    try:
-        p.perform_delete_session(slug, sid)
-    except FileNotFoundError:
-        raise HTTPException(404, "session file not found")
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    _provider(source).perform_delete_session(slug, sid)
     return {"ok": True, "source": source, "slug": slug, "sid": sid}
 
 
@@ -142,20 +154,12 @@ def legacy_projects():
 
 @app.get("/api/projects/{slug}/sessions")
 def legacy_project_sessions(slug: str):
-    try:
-        return _provider("claude").list_sessions(slug)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    return _provider("claude").list_sessions(slug)
 
 
 @app.get("/api/sessions/{slug}/{sid}")
 def legacy_session_detail(slug: str, sid: str, showAll: bool = False):
-    try:
-        return _provider("claude").session_payload(slug, sid, fold_synthetic=not showAll)
-    except FileNotFoundError as e:
-        raise HTTPException(404, str(e))
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    return _provider("claude").session_payload(slug, sid, fold_synthetic=not showAll)
 
 
 @app.post("/api/sessions/{slug}/{sid}/delete")
@@ -185,10 +189,7 @@ def get_keybindings():
 
 @app.post("/api/keybindings")
 def set_keybindings(mapping: dict):
-    try:
-        return S.save_keybindings(mapping)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    return S.save_keybindings(mapping)
 
 
 def main():
@@ -201,7 +202,17 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8642)
     parser.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
+    parser.add_argument(
+        "--log-level", default="info",
+        choices=("debug", "info", "warning", "error"),
+        help="verbosity of app logs (server access logs stay quiet)",
+    )
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(levelname)s %(name)s: %(message)s",
+    )
 
     url = f"http://{args.host}:{args.port}/"
     if not args.no_browser:
