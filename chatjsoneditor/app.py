@@ -13,8 +13,10 @@ from pydantic import BaseModel
 
 from . import sessions as S
 from .providers import get_provider, list_sources
+from .security import LocalOriginGuard, allow_any_host, is_loopback_host
 
 app = FastAPI(title="ChatJsonEditor")
+app.add_middleware(LocalOriginGuard)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -201,7 +203,26 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8642)
     parser.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="required to bind a non-loopback address; the API is unauthenticated "
+        "and can delete session files, so anyone who can reach it has full access",
+    )
     args = parser.parse_args()
+
+    if not is_loopback_host(args.host):
+        if not args.allow_remote:
+            parser.error(
+                f"refusing to bind {args.host}: the editor is unauthenticated and can "
+                "delete session files. Use --host 127.0.0.1, or pass --allow-remote "
+                "if the network is trusted."
+            )
+        allow_any_host()
+        print(
+            f"WARNING: listening on {args.host} — anyone who can reach this port can "
+            "read and delete your chat sessions."
+        )
 
     url = f"http://{args.host}:{args.port}/"
     if not args.no_browser:

@@ -248,9 +248,9 @@ class GeminiProvider:
         ]
 
     def _session_path(self, slug: str, sid: str) -> Path:
-        S.safe_name(slug)
         # sid is the file stem or full filename
         root = _root() / S.safe_name(slug)
+        sid = S.safe_name(sid)
         candidates = [
             root / "chats" / sid,
             root / "chats" / f"{sid}.json",

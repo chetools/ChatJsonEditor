@@ -386,10 +386,7 @@ class AntigravityProvider:
         return sorted(by_slug.values(), key=lambda p: p["label"].lower())
 
     def list_sessions(self, slug: str) -> list[dict]:
-        S.safe_name(slug) if re.match(r"^[A-Za-z0-9._%-]+$", slug) else slug
-        # validate
-        if ".." in slug:
-            raise ValueError(f"unsafe path component: {slug!r}")
+        S.safe_name(slug)
         out = []
         for s in self._all_sessions():
             if s["slug"] != slug:

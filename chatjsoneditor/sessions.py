@@ -16,6 +16,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote
 
 HEADER_TURN_ID = "__header__"
 
@@ -131,7 +132,16 @@ def save_keybindings(mapping: dict) -> dict[str, str]:
 
 
 def safe_name(name: str) -> str:
-    if not _NAME_RE.match(name) or ".." in name:
+    """Validate a single on-disk path component supplied by a client.
+
+    Percent-encoded separators are legitimate inside Grok's slugs (a whole cwd
+    encoded into one directory name), so they stay allowed, but the decoded
+    form must not smuggle traversal segments past a later ``unquote``.
+    """
+    if not name or not _NAME_RE.match(name) or ".." in name:
+        raise ValueError(f"unsafe path component: {name!r}")
+    decoded = unquote(name)
+    if ".." in decoded or "\x00" in decoded:
         raise ValueError(f"unsafe path component: {name!r}")
     return name
 
