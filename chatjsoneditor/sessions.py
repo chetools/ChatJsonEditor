@@ -19,7 +19,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote
 
+from . import jsonio
+
 log = logging.getLogger(__name__)
+
+# Providers reach for it as S.CorruptDataError; it lives with the readers that raise it.
+CorruptDataError = jsonio.CorruptDataError
 
 HEADER_TURN_ID = "__header__"
 
@@ -31,29 +36,24 @@ class ConflictError(Exception):
     """The file on disk no longer matches what the client last saw."""
 
 
-class CorruptDataError(Exception):
-    """On-disk data could not be parsed, so editing it would destroy content."""
+def env_root(env_var: str, *default_parts: str) -> Path:
+    """`$env_var` as a path, else ~/ joined with default_parts."""
+    override = os.environ.get(env_var)
+    if override:
+        return Path(override)
+    return Path.home().joinpath(*default_parts)
 
 
 def projects_root() -> Path:
-    override = os.environ.get("CLAUDE_PROJECTS_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".claude" / "projects"
+    return env_root("CLAUDE_PROJECTS_DIR", ".claude", "projects")
 
 
 def backups_root() -> Path:
-    override = os.environ.get("CHATJSONEDITOR_BACKUPS_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".claude" / "chatjsoneditor-backups"
+    return env_root("CHATJSONEDITOR_BACKUPS_DIR", ".claude", "chatjsoneditor-backups")
 
 
 def config_root() -> Path:
-    override = os.environ.get("CHATJSONEDITOR_CONFIG_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".claude" / "chatjsoneditor"
+    return env_root("CHATJSONEDITOR_CONFIG_DIR", ".claude", "chatjsoneditor")
 
 
 def grok_sessions_root() -> Path:
@@ -67,17 +67,11 @@ def grok_sessions_root() -> Path:
 
 
 def gemini_tmp_root() -> Path:
-    override = os.environ.get("GEMINI_TMP_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".gemini" / "tmp"
+    return env_root("GEMINI_TMP_DIR", ".gemini", "tmp")
 
 
 def antigravity_root() -> Path:
-    override = os.environ.get("ANTIGRAVITY_ROOT")
-    if override:
-        return Path(override)
-    return Path.home() / ".gemini" / "antigravity"
+    return env_root("ANTIGRAVITY_ROOT", ".gemini", "antigravity")
 
 
 # Default keyboard shortcuts (action -> combo string). Combos are normalized as
@@ -111,8 +105,8 @@ def load_keybindings() -> dict[str, str]:
     p = keybindings_path()
     if p.is_file():
         try:
-            saved = json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            saved = json.loads(jsonio.read_text(p))
+        except (json.JSONDecodeError, OSError, CorruptDataError):
             log.warning("ignoring unreadable keybindings file %s; using defaults", p,
                         exc_info=True)
             return result
@@ -205,19 +199,8 @@ class SessionDoc:
 
 
 def load_session(path: Path) -> SessionDoc:
-    # read_bytes + decode: no universal-newline translation, exact round-trip
-    text = path.read_bytes().decode("utf-8")
-    trailing = text.endswith("\n")
-    body = text[:-1] if trailing else text
-    entries = []
-    for line in body.split("\n") if body else []:
-        try:
-            data = json.loads(line)
-            if not isinstance(data, dict):
-                data = None
-        except json.JSONDecodeError:
-            data = None
-        entries.append(Entry(raw=line, data=data))
+    lines, trailing = jsonio.split_lines(jsonio.read_text(path))
+    entries = [Entry(raw=line, data=jsonio.parse_object(line)) for line in lines]
     return SessionDoc(path=path, entries=entries, trailing_newline=trailing)
 
 
@@ -435,7 +418,7 @@ def turn_messages(entries: list[Entry], turn: Turn) -> list[dict]:
                         "kind": "tool_use",
                         "id": b.get("id"),
                         "name": b.get("name", "?"),
-                        "input": _cap(json.dumps(b.get("input", {}), ensure_ascii=False, indent=2)),
+                        "input": _cap(jsonio.pretty(b.get("input", {}))),
                     })
         elif t == "system":
             out.append({"kind": "system", "text": d.get("subtype", "")})
@@ -581,7 +564,7 @@ def list_sessions(slug: str) -> list[dict]:
                     if is_human_prompt(e.data):
                         title = _preview(_text_of_blocks((e.data.get("message") or {}).get("content")), 80)
                         break
-        except (OSError, UnicodeDecodeError):
+        except (OSError, CorruptDataError):
             log.warning("could not read session %s", p, exc_info=True)
             title = "(unreadable)"
         try:
@@ -727,78 +710,55 @@ class History:
                 _atomic_write_bytes(p, data)
         self._save(state)
 
-    def undo(self, path: Path) -> None:
+    def _step(self, path: Path, from_stack: str, to_stack: str) -> None:
+        """Move one snapshot between the undo and redo stacks for a single file."""
         state = self._load()
-        if not state["undo"]:
-            raise ValueError("nothing to undo")
+        if not state[from_stack]:
+            raise ValueError(f"nothing to {from_stack}")
         current = self._snapshot_bytes(state, path.read_bytes())
-        name = state["undo"][-1]
+        name = state[from_stack][-1]
         restored = self._read_snapshot(name)
-        state["undo"].pop()
-        state["redo"].append(current)
+        state[from_stack].pop()
+        state[to_stack].append(current)
         _atomic_write_bytes(path, restored)
         self._save(state)
+
+    def _step_bundle(
+        self, paths: dict[str, Path], from_stack: str, to_stack: str
+    ) -> None:
+        """Move one snapshot bundle between the undo and redo stacks."""
+        state = self._load()
+        if not state[from_stack]:
+            raise ValueError(f"nothing to {from_stack}")
+        current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
+        cur_name = self._snapshot_bundle(state, current)
+        name = state[from_stack][-1]
+        restored = self._read_bundle(name)
+        state[from_stack].pop()
+        state[to_stack].append(cur_name)
+        for rel, data in restored.items():
+            p = paths.get(rel)
+            if p is None:
+                log.warning("snapshot %s holds %r which is not part of this session",
+                            name, rel)
+                continue
+            _atomic_write_bytes(p, data)
+        self._save(state)
+
+    def undo(self, path: Path) -> None:
+        self._step(path, "undo", "redo")
 
     def redo(self, path: Path) -> None:
-        state = self._load()
-        if not state["redo"]:
-            raise ValueError("nothing to redo")
-        current = self._snapshot_bytes(state, path.read_bytes())
-        name = state["redo"][-1]
-        restored = self._read_snapshot(name)
-        state["redo"].pop()
-        state["undo"].append(current)
-        _atomic_write_bytes(path, restored)
-        self._save(state)
+        self._step(path, "redo", "undo")
 
     def undo_bundle(self, paths: dict[str, Path]) -> None:
-        state = self._load()
-        if not state["undo"]:
-            raise ValueError("nothing to undo")
-        current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
-        cur_name = self._snapshot_bundle(state, current)
-        name = state["undo"][-1]
-        restored = self._read_bundle(name)
-        state["undo"].pop()
-        state["redo"].append(cur_name)
-        for rel, data in restored.items():
-            p = paths.get(rel)
-            if p is None:
-                log.warning("snapshot %s holds %r which is not part of this session",
-                            name, rel)
-                continue
-            _atomic_write_bytes(p, data)
-        self._save(state)
+        self._step_bundle(paths, "undo", "redo")
 
     def redo_bundle(self, paths: dict[str, Path]) -> None:
-        state = self._load()
-        if not state["redo"]:
-            raise ValueError("nothing to redo")
-        current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
-        cur_name = self._snapshot_bundle(state, current)
-        name = state["redo"][-1]
-        restored = self._read_bundle(name)
-        state["redo"].pop()
-        state["undo"].append(cur_name)
-        for rel, data in restored.items():
-            p = paths.get(rel)
-            if p is None:
-                log.warning("snapshot %s holds %r which is not part of this session",
-                            name, rel)
-                continue
-            _atomic_write_bytes(p, data)
-        self._save(state)
+        self._step_bundle(paths, "redo", "undo")
 
 
 # ------------------------------------------------------------ operations
-
-def check_hash(path: Path, expected: str, product: str = "the app") -> None:
-    if file_hash(path) != expected:
-        raise ConflictError(
-            f"The session file changed on disk (is it open in {product}?). "
-            "Reload before editing."
-        )
-
 
 def check_hash_value(actual: str, expected: str, product: str = "the app") -> None:
     if actual != expected:
@@ -806,6 +766,10 @@ def check_hash_value(actual: str, expected: str, product: str = "the app") -> No
             f"The session file changed on disk (is it open in {product}?). "
             "Reload before editing."
         )
+
+
+def check_hash(path: Path, expected: str, product: str = "the app") -> None:
+    check_hash_value(file_hash(path), expected, product)
 
 
 def perform_delete(slug: str, sid: str, turn_ids: list[str], expected_hash: str,

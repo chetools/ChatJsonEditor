@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .. import sessions as S
 from .base import register_provider
+from .common import session_payload
 
 
 class ClaudeProvider:
@@ -21,15 +22,12 @@ class ClaudeProvider:
         if not path.is_file():
             raise FileNotFoundError(f"no such session: {sid}")
         doc = S.load_session(path)
-        return {
-            "source": self.id,
-            "slug": slug,
-            "sid": sid,
-            "hash": S.file_hash(path),
-            "bytes": path.stat().st_size,
-            "turns": S.summarize_session(doc, fold_synthetic),
-            **S.History(slug, sid, source=self.id).status(),
-        }
+        return session_payload(
+            self.id, slug, sid,
+            hash=S.file_hash(path),
+            nbytes=path.stat().st_size,
+            turns=S.summarize_session(doc, fold_synthetic),
+        )
 
     def perform_delete(
         self,

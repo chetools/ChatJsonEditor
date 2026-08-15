@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from ..sessions import MAX_TOOL_TEXT, _cap, _preview
+from ..sessions import MAX_TOOL_TEXT, History, _cap, _preview
 
 
 @dataclass
@@ -101,6 +103,83 @@ def text_from_content(content) -> str:
 
 def cap_tool(s: str) -> str:
     return _cap(s or "", MAX_TOOL_TEXT)
+
+
+def session_payload(
+    source: str, slug: str, sid: str, *, hash: str, nbytes: int, turns: list[dict]
+) -> dict:
+    """The `/api/{source}/sessions/{slug}/{sid}` response envelope."""
+    return {
+        "source": source,
+        "slug": slug,
+        "sid": sid,
+        "hash": hash,
+        "bytes": nbytes,
+        "turns": turns,
+        **History(slug, sid, source=source).status(),
+    }
+
+
+def turn_spans(starts: Sequence[int], total: int) -> list[tuple[bool, int, int]]:
+    """(is_header, start, end) spans covering [0, total) given turn start indices.
+
+    Anything before the first start is a non-deletable header span; each start
+    owns everything up to the next one.
+    """
+    if not starts:
+        return [(True, 0, total)] if total else []
+    spans = []
+    if starts[0] > 0:
+        spans.append((True, 0, starts[0]))
+    for k, start in enumerate(starts):
+        end = starts[k + 1] if k + 1 < len(starts) else total
+        spans.append((False, start, end))
+    return spans
+
+
+def deleted_indices(
+    ranges_by_id: dict[str, tuple[int, int]], turn_ids: list[str]
+) -> set[int]:
+    """Indices covered by the requested turns; raises on unknown ids."""
+    unknown = [tid for tid in turn_ids if tid not in ranges_by_id]
+    if unknown:
+        raise ValueError(f"unknown or undeletable turn ids: {unknown}")
+    out: set[int] = set()
+    for tid in turn_ids:
+        start, end = ranges_by_id[tid]
+        out.update(range(start, end))
+    return out
+
+
+def group_projects(entries: Iterable[tuple[str, str]]) -> list[dict]:
+    """Collapse (slug, label) pairs into project rows with session counts."""
+    by_slug: dict[str, dict] = {}
+    for slug, label in entries:
+        row = by_slug.setdefault(
+            slug, {"slug": slug, "label": label, "sessionCount": 0}
+        )
+        row["sessionCount"] += 1
+    return sorted(by_slug.values(), key=lambda p: p["label"].lower())
+
+
+def first_prompt_title(turns: Iterable[NormTurn], default: str) -> str:
+    """First line of the first real user prompt, for session lists."""
+    for t in turns:
+        if not t.deletable:
+            continue
+        for m in t.messages:
+            if m.kind == "user" and m.text.strip():
+                return m.text.strip().splitlines()[0][:80]
+        break
+    return default
+
+
+def newest_mtime(paths: Iterable[Path], fallback: float) -> float:
+    return max([p.stat().st_mtime for p in paths if p.is_file()] + [fallback])
+
+
+def total_bytes(paths: Iterable[Path]) -> int:
+    return sum(p.stat().st_size for p in paths if p.is_file())
 
 
 _USER_QUERY_RE = re.compile(r"<user_query>\s*([\s\S]*?)\s*</user_query>", re.I)
