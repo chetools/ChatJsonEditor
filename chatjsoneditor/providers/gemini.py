@@ -8,9 +8,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .. import jsonio
 from .. import sessions as S
 from .base import register_provider
-from .common import NormMsg, NormTurn, cap_tool, text_from_content
+from .common import (
+    NormMsg,
+    NormTurn,
+    cap_tool,
+    deleted_indices,
+    first_prompt_title,
+    session_payload,
+    text_from_content,
+    turn_spans,
+)
 
 
 def _root() -> Path:
@@ -58,28 +68,22 @@ def _project_label(project_hash: str) -> str:
 
 def _load_messages(path: Path) -> tuple[list[dict], dict]:
     """Return (messages, envelope) where envelope holds outer metadata."""
-    raw = path.read_bytes()
-    text = raw.decode("utf-8")
+    text = jsonio.read_text(path)
     if path.suffix.lower() == ".jsonl" or (
         not text.lstrip().startswith("{") and not text.lstrip().startswith("[")
     ):
         messages = []
         for line in text.splitlines():
-            line = line.strip()
-            if not line:
+            obj = jsonio.parse_object(line.strip())
+            if obj is None:
                 continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                # wrap line as message if it looks like one
-                if "role" in obj or "type" in obj or "parts" in obj:
-                    messages.append(obj)
-                elif "message" in obj and isinstance(obj["message"], dict):
-                    messages.append(obj["message"])
-                else:
-                    messages.append(obj)
+            # unwrap {"message": {...}} envelopes; otherwise take the line as-is
+            if (
+                "role" not in obj and "type" not in obj and "parts" not in obj
+                and isinstance(obj.get("message"), dict)
+            ):
+                obj = obj["message"]
+            messages.append(obj)
         return messages, {"format": "jsonl"}
 
     try:
@@ -159,7 +163,7 @@ def _msg_to_norm(msg: dict) -> list[NormMsg]:
                     kind="tool_use",
                     id=fc.get("id") or fc.get("name"),
                     name=fc.get("name", "?"),
-                    input=cap_tool(json.dumps(args, ensure_ascii=False, indent=2)),
+                    input=cap_tool(jsonio.pretty(args)),
                 ))
             fr = p.get("functionResponse") or p.get("function_response")
             if fr and isinstance(fr, dict) and not text:
@@ -181,44 +185,40 @@ def _is_user_msg(msg: dict) -> bool:
     return _role_of(msg) in ("user", "human")
 
 
+def _turn_id(messages: list[dict], start: int) -> str:
+    mid = messages[start].get("id") or messages[start].get("messageId")
+    return str(mid) if mid else f"g{start}"
+
+
+def _turn_ranges(messages: list[dict]) -> dict[str, tuple[int, int]]:
+    """Deletable turn id → [start, end) message index range."""
+    starts = [i for i, m in enumerate(messages) if _is_user_msg(m)]
+    return {
+        _turn_id(messages, start): (start, end)
+        for is_header, start, end in turn_spans(starts, len(messages))
+        if not is_header
+    }
+
+
 def _group_turns(messages: list[dict], fold_synthetic: bool = True) -> list[NormTurn]:
     starts = [i for i, m in enumerate(messages) if _is_user_msg(m)]
-    if not starts:
-        if messages:
-            msgs = []
-            for m in messages:
-                msgs.extend(_msg_to_norm(m))
-            return [NormTurn(id=S.HEADER_TURN_ID, deletable=False, messages=msgs)]
-        return []
     turns: list[NormTurn] = []
-    if starts[0] > 0:
-        msgs = []
-        for m in messages[: starts[0]]:
-            msgs.extend(_msg_to_norm(m))
-        turns.append(NormTurn(id=S.HEADER_TURN_ID, deletable=False, messages=msgs))
-    for k, start in enumerate(starts):
-        end = starts[k + 1] if k + 1 < len(starts) else len(messages)
-        msgs = []
+    for is_header, start, end in turn_spans(starts, len(messages)):
+        msgs: list[NormMsg] = []
         for m in messages[start:end]:
             msgs.extend(_msg_to_norm(m))
-        tid = f"g{start}"
-        # optional message id
-        mid = messages[start].get("id") or messages[start].get("messageId")
-        if mid:
-            tid = str(mid)
-        turns.append(NormTurn(id=tid, deletable=True, messages=msgs))
+        tid = S.HEADER_TURN_ID if is_header else _turn_id(messages, start)
+        turns.append(NormTurn(id=tid, deletable=not is_header, messages=msgs))
     return turns
 
 
 def _rewrite_file(path: Path, envelope: dict, messages: list[dict]) -> bytes:
     if path.suffix.lower() == ".jsonl" or envelope.get("format") == "jsonl":
-        lines = [json.dumps(m, ensure_ascii=False) for m in messages]
-        text = "\n".join(lines)
-        if text:
-            text += "\n"
-        return text.encode("utf-8")
+        return jsonio.join_lines(
+            json.dumps(m, ensure_ascii=False) for m in messages
+        )
     if envelope.get("format") == "list":
-        return (json.dumps(messages, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        return jsonio.dump_json(messages)
     # object envelope
     data = dict(envelope)
     data.pop("format", None)
@@ -230,7 +230,7 @@ def _rewrite_file(path: Path, envelope: dict, messages: list[dict]) -> bytes:
             break
     if not written:
         data["messages"] = messages
-    return (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    return jsonio.dump_json(data)
 
 
 class GeminiProvider:
@@ -278,18 +278,10 @@ class GeminiProvider:
             messages, _ = _load_messages(path)
             turns = _group_turns(messages)
             turn_count = sum(1 for t in turns if t.deletable)
-            title = path.stem
-            for t in turns:
-                if t.deletable:
-                    for m in t.messages:
-                        if m.kind == "user" and m.text.strip():
-                            title = m.text.strip().splitlines()[0][:80]
-                            break
-                    break
             st = path.stat()
             out.append({
                 "sid": path.name,  # keep extension for disambiguation
-                "title": title,
+                "title": first_prompt_title(turns, path.stem),
                 "mtime": st.st_mtime,
                 "bytes": st.st_size,
                 "turnCount": turn_count,
@@ -300,16 +292,13 @@ class GeminiProvider:
     def session_payload(self, slug: str, sid: str, fold_synthetic: bool = True) -> dict:
         path = self._session_path(slug, sid)
         messages, _ = _load_messages(path)
-        turns = [t.to_summary(i) for i, t in enumerate(_group_turns(messages, fold_synthetic))]
-        return {
-            "source": self.id,
-            "slug": slug,
-            "sid": sid,
-            "hash": S.file_hash(path),
-            "bytes": path.stat().st_size,
-            "turns": turns,
-            **S.History(slug, sid, source=self.id).status(),
-        }
+        turns = _group_turns(messages, fold_synthetic)
+        return session_payload(
+            self.id, slug, sid,
+            hash=S.file_hash(path),
+            nbytes=path.stat().st_size,
+            turns=[t.to_summary(i) for i, t in enumerate(turns)],
+        )
 
     def perform_delete_session(self, slug: str, sid: str) -> None:
         path = self._session_path(slug, sid)
@@ -327,29 +316,7 @@ class GeminiProvider:
         path = self._session_path(slug, sid)
         S.check_hash(path, expected_hash, self.product_name)
         messages, envelope = _load_messages(path)
-        turns = _group_turns(messages, fold_synthetic)
-        by_id = {t.id: t for t in turns if t.deletable}
-        # map turn id back to message index ranges
-        starts = [i for i, m in enumerate(messages) if _is_user_msg(m)]
-        id_to_range: dict[str, tuple[int, int]] = {}
-        # rebuild ranges aligned with _group_turns
-        if starts:
-            if starts[0] > 0:
-                pass  # header non-deletable
-            for k, start in enumerate(starts):
-                end = starts[k + 1] if k + 1 < len(starts) else len(messages)
-                tid = f"g{start}"
-                mid = messages[start].get("id") or messages[start].get("messageId")
-                if mid:
-                    tid = str(mid)
-                id_to_range[tid] = (start, end)
-        unknown = [tid for tid in turn_ids if tid not in id_to_range]
-        if unknown:
-            raise ValueError(f"unknown or undeletable turn ids: {unknown}")
-        del_idx: set[int] = set()
-        for tid in turn_ids:
-            a, b = id_to_range[tid]
-            del_idx.update(range(a, b))
+        del_idx = deleted_indices(_turn_ranges(messages), turn_ids)
         new_messages = [m for i, m in enumerate(messages) if i not in del_idx]
         new_bytes = _rewrite_file(path, envelope, new_messages)
         # write as text if utf-8

@@ -17,6 +17,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import jsonio
+
 HEADER_TURN_ID = "__header__"
 
 # Allow URL-encoded path segments (Grok uses %3A etc.) and UUIDs.
@@ -27,25 +29,24 @@ class ConflictError(Exception):
     """The file on disk no longer matches what the client last saw."""
 
 
-def projects_root() -> Path:
-    override = os.environ.get("CLAUDE_PROJECTS_DIR")
+def env_root(env_var: str, *default_parts: str) -> Path:
+    """`$env_var` as a path, else ~/ joined with default_parts."""
+    override = os.environ.get(env_var)
     if override:
         return Path(override)
-    return Path.home() / ".claude" / "projects"
+    return Path.home().joinpath(*default_parts)
+
+
+def projects_root() -> Path:
+    return env_root("CLAUDE_PROJECTS_DIR", ".claude", "projects")
 
 
 def backups_root() -> Path:
-    override = os.environ.get("CHATJSONEDITOR_BACKUPS_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".claude" / "chatjsoneditor-backups"
+    return env_root("CHATJSONEDITOR_BACKUPS_DIR", ".claude", "chatjsoneditor-backups")
 
 
 def config_root() -> Path:
-    override = os.environ.get("CHATJSONEDITOR_CONFIG_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".claude" / "chatjsoneditor"
+    return env_root("CHATJSONEDITOR_CONFIG_DIR", ".claude", "chatjsoneditor")
 
 
 def grok_sessions_root() -> Path:
@@ -59,17 +60,11 @@ def grok_sessions_root() -> Path:
 
 
 def gemini_tmp_root() -> Path:
-    override = os.environ.get("GEMINI_TMP_DIR")
-    if override:
-        return Path(override)
-    return Path.home() / ".gemini" / "tmp"
+    return env_root("GEMINI_TMP_DIR", ".gemini", "tmp")
 
 
 def antigravity_root() -> Path:
-    override = os.environ.get("ANTIGRAVITY_ROOT")
-    if override:
-        return Path(override)
-    return Path.home() / ".gemini" / "antigravity"
+    return env_root("ANTIGRAVITY_ROOT", ".gemini", "antigravity")
 
 
 # Default keyboard shortcuts (action -> combo string). Combos are normalized as
@@ -100,16 +95,9 @@ def keybindings_path() -> Path:
 def load_keybindings() -> dict[str, str]:
     """Defaults merged with the on-disk overrides (unknown actions ignored)."""
     result = dict(DEFAULT_KEYBINDINGS)
-    p = keybindings_path()
-    if p.is_file():
-        try:
-            saved = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(saved, dict):
-                for action, combo in saved.items():
-                    if action in DEFAULT_KEYBINDINGS and isinstance(combo, str) and combo:
-                        result[action] = combo
-        except (json.JSONDecodeError, OSError):
-            pass
+    for action, combo in jsonio.read_json(keybindings_path()).items():
+        if action in DEFAULT_KEYBINDINGS and isinstance(combo, str) and combo:
+            result[action] = combo
     return result
 
 
@@ -182,19 +170,8 @@ class SessionDoc:
 
 
 def load_session(path: Path) -> SessionDoc:
-    # read_bytes + decode: no universal-newline translation, exact round-trip
-    text = path.read_bytes().decode("utf-8")
-    trailing = text.endswith("\n")
-    body = text[:-1] if trailing else text
-    entries = []
-    for line in body.split("\n") if body else []:
-        try:
-            data = json.loads(line)
-            if not isinstance(data, dict):
-                data = None
-        except json.JSONDecodeError:
-            data = None
-        entries.append(Entry(raw=line, data=data))
+    lines, trailing = jsonio.split_lines(jsonio.read_text(path))
+    entries = [Entry(raw=line, data=jsonio.parse_object(line)) for line in lines]
     return SessionDoc(path=path, entries=entries, trailing_newline=trailing)
 
 
@@ -216,7 +193,7 @@ def atomic_write(path: Path, text: str) -> None:
         raise
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
+def atomic_write_bytes(path: Path, data: bytes) -> None:
     """Atomic-ish binary write; falls back to in-place rewrite on Windows locks."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
@@ -414,7 +391,7 @@ def turn_messages(entries: list[Entry], turn: Turn) -> list[dict]:
                         "kind": "tool_use",
                         "id": b.get("id"),
                         "name": b.get("name", "?"),
-                        "input": _cap(json.dumps(b.get("input", {}), ensure_ascii=False, indent=2)),
+                        "input": _cap(jsonio.pretty(b.get("input", {}))),
                     })
         elif t == "system":
             out.append({"kind": "system", "text": d.get("subtype", "")})
@@ -586,12 +563,9 @@ class History:
         self.state_path = self.dir / "state.json"
 
     def _load(self) -> dict:
-        if self.state_path.is_file():
-            try:
-                return json.loads(self.state_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
-        return {"undo": [], "redo": [], "counter": 0}
+        return jsonio.read_json(
+            self.state_path, {"undo": [], "redo": [], "counter": 0}
+        )
 
     def _save(self, state: dict) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -636,17 +610,7 @@ class History:
         name = self._snapshot_bytes(state, path.read_bytes(), suffix=".bin")
         state["undo"].append(name)
         state["redo"] = []
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(new_bytes)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        atomic_write_bytes(path, new_bytes)
         self._save(state)
 
     def record_and_write_bundle(
@@ -664,100 +628,58 @@ class History:
             if isinstance(data, str):
                 atomic_write(p, data)
             else:
-                _atomic_write_bytes(p, data)
+                atomic_write_bytes(p, data)
+        self._save(state)
+
+    def _step(self, path: Path, from_stack: str, to_stack: str) -> None:
+        """Move one snapshot between the undo and redo stacks for a single file."""
+        state = self._load()
+        if not state[from_stack]:
+            raise ValueError(f"nothing to {from_stack}")
+        current = self._snapshot_bytes(state, path.read_bytes())
+        name = state[from_stack].pop()
+        restored = (self.dir / name).read_bytes()
+        state[to_stack].append(current)
+        # binary-safe when snapshot is .bin; text otherwise
+        if name.endswith(".bin"):
+            atomic_write_bytes(path, restored)
+        else:
+            atomic_write(path, restored.decode("utf-8"))
+        self._save(state)
+
+    def _step_bundle(
+        self, paths: dict[str, Path], from_stack: str, to_stack: str
+    ) -> None:
+        """Move one snapshot bundle between the undo and redo stacks."""
+        state = self._load()
+        if not state[from_stack]:
+            raise ValueError(f"nothing to {from_stack}")
+        current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
+        cur_name = self._snapshot_bundle(state, current)
+        name = state[from_stack].pop()
+        restored = self._read_bundle(name)
+        state[to_stack].append(cur_name)
+        for rel, data in restored.items():
+            p = paths.get(rel)
+            if p is None:
+                continue
+            atomic_write_bytes(p, data)
         self._save(state)
 
     def undo(self, path: Path) -> None:
-        state = self._load()
-        if not state["undo"]:
-            raise ValueError("nothing to undo")
-        current = self._snapshot_bytes(state, path.read_bytes())
-        name = state["undo"].pop()
-        restored = (self.dir / name).read_bytes()
-        state["redo"].append(current)
-        # binary-safe when snapshot is .bin; text otherwise
-        if name.endswith(".bin"):
-            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    f.write(restored)
-                os.replace(tmp, path)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-        else:
-            atomic_write(path, restored.decode("utf-8"))
-        self._save(state)
+        self._step(path, "undo", "redo")
 
     def redo(self, path: Path) -> None:
-        state = self._load()
-        if not state["redo"]:
-            raise ValueError("nothing to redo")
-        current = self._snapshot_bytes(state, path.read_bytes())
-        name = state["redo"].pop()
-        restored = (self.dir / name).read_bytes()
-        state["undo"].append(current)
-        if name.endswith(".bin"):
-            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    f.write(restored)
-                os.replace(tmp, path)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-        else:
-            atomic_write(path, restored.decode("utf-8"))
-        self._save(state)
+        self._step(path, "redo", "undo")
 
     def undo_bundle(self, paths: dict[str, Path]) -> None:
-        state = self._load()
-        if not state["undo"]:
-            raise ValueError("nothing to undo")
-        current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
-        cur_name = self._snapshot_bundle(state, current)
-        name = state["undo"].pop()
-        restored = self._read_bundle(name)
-        state["redo"].append(cur_name)
-        for rel, data in restored.items():
-            p = paths.get(rel)
-            if p is None:
-                continue
-            _atomic_write_bytes(p, data)
-        self._save(state)
+        self._step_bundle(paths, "undo", "redo")
 
     def redo_bundle(self, paths: dict[str, Path]) -> None:
-        state = self._load()
-        if not state["redo"]:
-            raise ValueError("nothing to redo")
-        current = {rel: p.read_bytes() for rel, p in paths.items() if p.is_file()}
-        cur_name = self._snapshot_bundle(state, current)
-        name = state["redo"].pop()
-        restored = self._read_bundle(name)
-        state["undo"].append(cur_name)
-        for rel, data in restored.items():
-            p = paths.get(rel)
-            if p is None:
-                continue
-            _atomic_write_bytes(p, data)
-        self._save(state)
+        self._step_bundle(paths, "redo", "undo")
 
 
 # ------------------------------------------------------------ operations
-
-def check_hash(path: Path, expected: str, product: str = "the app") -> None:
-    if file_hash(path) != expected:
-        raise ConflictError(
-            f"The session file changed on disk (is it open in {product}?). "
-            "Reload before editing."
-        )
-
 
 def check_hash_value(actual: str, expected: str, product: str = "the app") -> None:
     if actual != expected:
@@ -765,6 +687,10 @@ def check_hash_value(actual: str, expected: str, product: str = "the app") -> No
             f"The session file changed on disk (is it open in {product}?). "
             "Reload before editing."
         )
+
+
+def check_hash(path: Path, expected: str, product: str = "the app") -> None:
+    check_hash_value(file_hash(path), expected, product)
 
 
 def perform_delete(slug: str, sid: str, turn_ids: list[str], expected_hash: str,

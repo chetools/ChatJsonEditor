@@ -11,9 +11,17 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from .. import jsonio
 from .. import sessions as S
 from .base import register_provider
-from .common import NormMsg, NormTurn, cap_tool
+from .common import (
+    NormMsg,
+    NormTurn,
+    cap_tool,
+    first_prompt_title,
+    group_projects,
+    session_payload,
+)
 
 # Verified correlation: step_type 14 ↔ USER_INPUT in transcript.
 STEP_USER_INPUT = 14
@@ -33,19 +41,15 @@ def _brain_dir() -> Path:
 
 def _config_projects() -> dict[str, str]:
     """Map folder path → project name from ~/.gemini/config/projects."""
-    cfg = Path.home() / ".gemini" / "config" / "projects"
-    override = __import__("os").environ.get("ANTIGRAVITY_CONFIG_PROJECTS")
-    if override:
-        cfg = Path(override)
+    cfg = S.env_root("ANTIGRAVITY_CONFIG_PROJECTS", ".gemini", "config", "projects")
     out: dict[str, str] = {}
     if not cfg.is_dir():
         return out
     for p in cfg.glob("*.json"):
         if p.name == "outside-of-project.json":
             continue
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        data = jsonio.read_json(p)
+        if not data:
             continue
         name = data.get("name") or p.stem
         resources = (data.get("projectResources") or {}).get("resources") or []
@@ -111,19 +115,34 @@ def _transcript_full_path(cid: str) -> Path | None:
 
 def _load_transcript(cid: str) -> list[dict]:
     path = _transcript_path(cid)
-    if not path:
-        return []
-    out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    return jsonio.load_objects(path) if path else []
+
+
+def _bundle_paths(cid: str, db: Path) -> dict[str, Path]:
+    """Snapshot bundle: the SQLite store plus whichever transcripts exist."""
+    paths = {"conversation.db": db}
+    tpath = _transcript_path(cid)
+    tfpath = _transcript_full_path(cid)
+    if tpath:
+        paths["transcript.jsonl"] = tpath
+    if tfpath:
+        paths["transcript_full.jsonl"] = tfpath
+    return paths
+
+
+def _transcript_without_steps(path: Path, del_idxs: set[int]) -> bytes:
+    """Transcript bytes with lines for the deleted step indices removed."""
+    kept = []
+    for line in jsonio.read_text(path).splitlines():
         if not line.strip():
             continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            out.append(obj)
-    return out
+        obj = jsonio.parse_object(line)
+        if obj is not None:
+            si = obj.get("step_index")
+            if si is not None and int(si) in del_idxs:
+                continue
+        kept.append(line)
+    return jsonio.join_lines(kept)
 
 
 def _open_db(db_path: Path, readonly: bool = False) -> sqlite3.Connection:
@@ -343,14 +362,7 @@ class AntigravityProvider:
                 turn_count = sum(1 for t in turns if t.deletable)
             except Exception:
                 turn_count = 0
-            title = sid
-            for t in turns:
-                if t.deletable:
-                    for m in t.messages:
-                        if m.kind == "user" and m.text.strip():
-                            title = m.text.strip().splitlines()[0][:80]
-                            break
-                    break
+            title = first_prompt_title(turns, sid)
             # try task.md / brain
             task = _brain_dir() / sid / "task.md"
             if task.is_file():
@@ -373,17 +385,9 @@ class AntigravityProvider:
         return out
 
     def list_projects(self) -> list[dict]:
-        by_slug: dict[str, dict] = {}
-        for s in self._all_sessions():
-            slug = s["slug"]
-            if slug not in by_slug:
-                by_slug[slug] = {
-                    "slug": slug,
-                    "label": s["label"],
-                    "sessionCount": 0,
-                }
-            by_slug[slug]["sessionCount"] += 1
-        return sorted(by_slug.values(), key=lambda p: p["label"].lower())
+        return group_projects(
+            (s["slug"], s["label"]) for s in self._all_sessions()
+        )
 
     def list_sessions(self, slug: str) -> list[dict]:
         S.safe_name(slug) if re.match(r"^[A-Za-z0-9._%-]+$", slug) else slug
@@ -420,28 +424,19 @@ class AntigravityProvider:
 
     def session_payload(self, slug: str, sid: str, fold_synthetic: bool = True) -> dict:
         db = self._resolve(slug, sid)
-        turns = [t.to_summary(i) for i, t in enumerate(_build_turns(sid, db, fold_synthetic))]
-        return {
-            "source": self.id,
-            "slug": slug,
-            "sid": sid,
-            "hash": S.file_hash(db),
-            "bytes": db.stat().st_size,
-            "turns": turns,
-            **S.History(slug, sid, source=self.id).status(),
-        }
+        turns = _build_turns(sid, db, fold_synthetic)
+        return session_payload(
+            self.id, slug, sid,
+            hash=S.file_hash(db),
+            nbytes=db.stat().st_size,
+            turns=[t.to_summary(i) for i, t in enumerate(turns)],
+        )
 
     def perform_delete_session(self, slug: str, sid: str) -> None:
         import shutil
 
         db = self._resolve(slug, sid)
-        files: dict[str, bytes] = {db.name: db.read_bytes()}
-        tpath = _transcript_path(sid)
-        tfpath = _transcript_full_path(sid)
-        if tpath and tpath.is_file():
-            files[tpath.name] = tpath.read_bytes()
-        if tfpath and tfpath.is_file():
-            files[tfpath.name] = tfpath.read_bytes()
+        files = {p.name: p.read_bytes() for p in _bundle_paths(sid, db).values()}
         S.archive_deleted_session(self.id, slug, sid, files)
         db.unlink()
         # remove auxiliary brain tree for this conversation id
@@ -475,15 +470,6 @@ class AntigravityProvider:
                 if a <= r["idx"] < b:
                     del_idxs.add(r["idx"])
 
-        # Read full DB bytes for snapshot, then mutate via sqlite
-        paths = {"conversation.db": db}
-        tpath = _transcript_path(sid)
-        tfpath = _transcript_full_path(sid)
-        if tpath:
-            paths["transcript.jsonl"] = tpath
-        if tfpath:
-            paths["transcript_full.jsonl"] = tfpath
-
         # Perform deletion in a temp copy then replace
         import shutil
         import tempfile
@@ -507,52 +493,11 @@ class AntigravityProvider:
             finally:
                 con.close()
 
-            new_db_bytes = Path(tmp_db).read_bytes()
-
-            new_data: dict[str, bytes] = {"conversation.db": new_db_bytes}
-            if tpath and tpath.is_file():
-                kept = []
-                for line in tpath.read_text(encoding="utf-8").splitlines():
-                    if not line.strip():
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        kept.append(line)
-                        continue
-                    si = obj.get("step_index")
-                    if si is not None and int(si) in del_idxs:
-                        continue
-                    kept.append(line)
-                text = "\n".join(kept)
-                if text:
-                    text += "\n"
-                new_data["transcript.jsonl"] = text.encode("utf-8")
-            if tfpath and tfpath.is_file():
-                kept = []
-                for line in tfpath.read_text(encoding="utf-8").splitlines():
-                    if not line.strip():
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        kept.append(line)
-                        continue
-                    si = obj.get("step_index")
-                    if si is not None and int(si) in del_idxs:
-                        continue
-                    kept.append(line)
-                text = "\n".join(kept)
-                if text:
-                    text += "\n"
-                new_data["transcript_full.jsonl"] = text.encode("utf-8")
-
-            # Map path keys for History
-            path_map = {"conversation.db": db}
-            if tpath:
-                path_map["transcript.jsonl"] = tpath
-            if tfpath:
-                path_map["transcript_full.jsonl"] = tfpath
+            path_map = _bundle_paths(sid, db)
+            new_data: dict[str, bytes] = {"conversation.db": Path(tmp_db).read_bytes()}
+            for rel, p in path_map.items():
+                if rel != "conversation.db":
+                    new_data[rel] = _transcript_without_steps(p, del_idxs)
             S.History(slug, sid, source=self.id).record_and_write_bundle(path_map, new_data)
         finally:
             try:
@@ -560,29 +505,19 @@ class AntigravityProvider:
             except OSError:
                 pass
 
-    def perform_undo(self, slug: str, sid: str, expected_hash: str) -> None:
+    def _guarded_bundle(self, slug: str, sid: str, expected_hash: str) -> dict[str, Path]:
+        """Hash-guarded snapshot bundle for undo/redo."""
         db = self._resolve(slug, sid)
         S.check_hash(db, expected_hash, self.product_name)
-        path_map = {"conversation.db": db}
-        tpath = _transcript_path(sid)
-        tfpath = _transcript_full_path(sid)
-        if tpath:
-            path_map["transcript.jsonl"] = tpath
-        if tfpath:
-            path_map["transcript_full.jsonl"] = tfpath
-        S.History(slug, sid, source=self.id).undo_bundle(path_map)
+        return _bundle_paths(sid, db)
+
+    def perform_undo(self, slug: str, sid: str, expected_hash: str) -> None:
+        paths = self._guarded_bundle(slug, sid, expected_hash)
+        S.History(slug, sid, source=self.id).undo_bundle(paths)
 
     def perform_redo(self, slug: str, sid: str, expected_hash: str) -> None:
-        db = self._resolve(slug, sid)
-        S.check_hash(db, expected_hash, self.product_name)
-        path_map = {"conversation.db": db}
-        tpath = _transcript_path(sid)
-        tfpath = _transcript_full_path(sid)
-        if tpath:
-            path_map["transcript.jsonl"] = tpath
-        if tfpath:
-            path_map["transcript_full.jsonl"] = tfpath
-        S.History(slug, sid, source=self.id).redo_bundle(path_map)
+        paths = self._guarded_bundle(slug, sid, expected_hash)
+        S.History(slug, sid, source=self.id).redo_bundle(paths)
 
 
 register_provider(AntigravityProvider())

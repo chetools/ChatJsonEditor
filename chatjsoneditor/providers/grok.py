@@ -8,11 +8,10 @@ model_id heuristics (Grok Build wins on overlap).
 from __future__ import annotations
 
 import json
-import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote
 
+from .. import jsonio
 from .. import sessions as S
 from ..sessions import HEADER_TURN_ID, Turn
 from .base import register_provider
@@ -20,9 +19,15 @@ from .common import (
     NormMsg,
     NormTurn,
     cap_tool,
+    deleted_indices,
     extract_user_query,
+    group_projects,
     is_grok_synthetic_user,
+    newest_mtime,
+    session_payload,
     text_from_content,
+    total_bytes,
+    turn_spans,
 )
 
 # Identity files hashed + snapshotted for edit safety.
@@ -60,11 +65,7 @@ def _session_dirs(root: Path) -> list[tuple[str, Path, dict]]:
             summary_path = sess / "summary.json"
             if not summary_path.is_file():
                 continue
-            try:
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                summary = {}
-            out.append((proj.name, sess, summary))
+            out.append((proj.name, sess, jsonio.read_json(summary_path)))
     return out
 
 
@@ -87,32 +88,8 @@ def _hash_session(sess_dir: Path) -> str:
     return S.multi_file_hash([sess_dir / n for n in _IDENTITY])
 
 
-def _load_jsonl(path: Path) -> list[tuple[str, dict | None]]:
-    if not path.is_file():
-        return []
-    text = path.read_bytes().decode("utf-8")
-    trailing = text.endswith("\n")
-    body = text[:-1] if trailing else text
-    rows = []
-    for line in body.split("\n") if body else []:
-        try:
-            data = json.loads(line)
-            if not isinstance(data, dict):
-                data = None
-        except json.JSONDecodeError:
-            data = None
-        rows.append((line, data))
-    return rows
-
-
 def _write_jsonl(rows: list[tuple[str, dict | None]], trailing: bool = True) -> bytes:
-    lines = [raw for raw, _ in rows]
-    text = "\n".join(lines)
-    if trailing and text:
-        text += "\n"
-    elif trailing and not text:
-        text = ""
-    return text.encode("utf-8")
+    return jsonio.join_lines((raw for raw, _ in rows), trailing=trailing)
 
 
 def _chat_user_text(data: dict) -> str:
@@ -178,12 +155,11 @@ def _messages_from_chat_span(rows: list[tuple[str, dict | None]], start: int, en
                 args = tc.get("arguments", tc.get("input", {}))
                 if isinstance(args, str):
                     try:
-                        args_obj = json.loads(args)
-                        inp = json.dumps(args_obj, ensure_ascii=False, indent=2)
+                        inp = jsonio.pretty(json.loads(args))
                     except json.JSONDecodeError:
                         inp = args
                 else:
-                    inp = json.dumps(args or {}, ensure_ascii=False, indent=2)
+                    inp = jsonio.pretty(args or {})
                 msgs.append(NormMsg(
                     kind="tool_use",
                     id=tc.get("id"),
@@ -204,7 +180,7 @@ def _messages_from_chat_span(rows: list[tuple[str, dict | None]], start: int, en
                 kind="tool_use",
                 id=data.get("id") or f"backend-{len(msgs)}",
                 name=str(name),
-                input=cap_tool(json.dumps(kind, ensure_ascii=False, indent=2)),
+                input=cap_tool(jsonio.pretty(kind)),
             ))
     return msgs
 
@@ -212,31 +188,23 @@ def _messages_from_chat_span(rows: list[tuple[str, dict | None]], start: int, en
 def _group_chat_turns(
     rows: list[tuple[str, dict | None]], fold_synthetic: bool
 ) -> list[tuple[Turn, list[NormMsg]]]:
-    starts = []
-    for i, (_, data) in enumerate(rows):
-        if data and _is_turn_start_chat(data, fold_synthetic):
-            starts.append(i)
-    if not starts:
-        if rows:
-            msgs = _messages_from_chat_span(rows, 0, len(rows))
-            t = Turn(HEADER_TURN_ID, 0, len(rows), False)
-            return [(t, msgs)]
-        return []
+    starts = [
+        i for i, (_, data) in enumerate(rows)
+        if data and _is_turn_start_chat(data, fold_synthetic)
+    ]
     turns: list[tuple[Turn, list[NormMsg]]] = []
-    if starts[0] > 0:
-        msgs = _messages_from_chat_span(rows, 0, starts[0])
-        turns.append((Turn(HEADER_TURN_ID, 0, starts[0], False), msgs))
-    for k, start in enumerate(starts):
-        end = starts[k + 1] if k + 1 < len(starts) else len(rows)
-        data = rows[start][1] or {}
-        text = _chat_user_text(data)
-        q = extract_user_query(text) or text
-        tid = f"chat-{start}"
-        # stable-ish id from content hash of first 80 chars
-        tid = f"u{start}-{abs(hash(q[:80])) % 10**8}"
+    for is_header, start, end in turn_spans(starts, len(rows)):
         msgs = _messages_from_chat_span(rows, start, end)
-        turns.append((Turn(tid, start, end, True), msgs))
+        tid = HEADER_TURN_ID if is_header else _chat_turn_id(rows, start)
+        turns.append((Turn(tid, start, end, not is_header), msgs))
     return turns
+
+
+def _chat_turn_id(rows: list[tuple[str, dict | None]], start: int) -> str:
+    """Stable-ish turn id from the prompt position + a hash of its first chars."""
+    text = _chat_user_text(rows[start][1] or {})
+    q = extract_user_query(text) or text
+    return f"u{start}-{abs(hash(q[:80])) % 10**8}"
 
 
 def _group_update_turns(
@@ -298,14 +266,8 @@ def _delete_chat_turns(
     fold_synthetic: bool,
 ) -> list[tuple[str, dict | None]]:
     grouped = _group_chat_turns(rows, fold_synthetic)
-    by_id = {t.id: (t, msgs) for t, msgs in grouped if t.deletable}
-    unknown = [tid for tid in turn_ids if tid not in by_id]
-    if unknown:
-        raise ValueError(f"unknown or undeletable turn ids: {unknown}")
-    del_idx: set[int] = set()
-    for tid in turn_ids:
-        t, _ = by_id[tid]
-        del_idx.update(range(t.start, t.end))
+    by_id = {t.id: (t.start, t.end) for t, _ in grouped if t.deletable}
+    del_idx = deleted_indices(by_id, turn_ids)
     return [row for i, row in enumerate(rows) if i not in del_idx]
 
 
@@ -353,30 +315,17 @@ class _GrokBase:
         return matched
 
     def list_projects(self) -> list[dict]:
-        by_slug: dict[str, dict] = {}
-        for slug, sess, summary in self._iter_matching():
-            if slug not in by_slug:
-                by_slug[slug] = {
-                    "slug": slug,
-                    "label": _cwd_label(slug, summary),
-                    "sessionCount": 0,
-                }
-            by_slug[slug]["sessionCount"] += 1
-        return sorted(by_slug.values(), key=lambda p: p["label"].lower())
+        return group_projects(
+            (slug, _cwd_label(slug, summary))
+            for slug, _, summary in self._iter_matching()
+        )
 
     def _sess_dir(self, slug: str, sid: str) -> Path:
         d = self._root() / S.safe_name(slug) / S.safe_name(sid)
         if not d.is_dir():
             raise FileNotFoundError(f"no such session: {sid}")
         # verify classification
-        summary_path = d / "summary.json"
-        summary = {}
-        if summary_path.is_file():
-            try:
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
-        is_build = _is_build_session(summary)
+        is_build = _is_build_session(jsonio.read_json(d / "summary.json"))
         if self.build_only and not is_build:
             raise FileNotFoundError(f"session {sid} is not a Grok Build session")
         if not self.build_only and is_build:
@@ -394,25 +343,14 @@ class _GrokBase:
                 or summary.get("session_summary")
                 or sess.name
             )
-            chat = sess / "chat_history.jsonl"
-            turn_count = 0
-            if chat.is_file():
-                rows = _load_jsonl(chat)
-                turn_count = sum(
-                    1 for t, _ in _group_chat_turns(rows, True) if t.deletable
-                )
-            # size: identity files
-            nbytes = sum((sess / n).stat().st_size for n in _IDENTITY if (sess / n).is_file())
-            mtime = sess.stat().st_mtime
-            for n in _IDENTITY:
-                p = sess / n
-                if p.is_file():
-                    mtime = max(mtime, p.stat().st_mtime)
+            rows = jsonio.load_rows(sess / "chat_history.jsonl")
+            turn_count = sum(1 for t, _ in _group_chat_turns(rows, True) if t.deletable)
+            identity = list(_identity_paths(sess).values())
             out.append({
                 "sid": sess.name,
                 "title": title,
-                "mtime": mtime,
-                "bytes": nbytes,
+                "mtime": newest_mtime(identity, sess.stat().st_mtime),
+                "bytes": total_bytes(identity),
                 "turnCount": turn_count,
                 "model": summary.get("current_model_id"),
                 "agent": summary.get("agent_name"),
@@ -422,18 +360,13 @@ class _GrokBase:
 
     def session_payload(self, slug: str, sid: str, fold_synthetic: bool = True) -> dict:
         d = self._sess_dir(slug, sid)
-        chat_rows = _load_jsonl(d / "chat_history.jsonl")
-        turns = _summarize_from_chat(chat_rows, fold_synthetic)
-        nbytes = sum((d / n).stat().st_size for n in _IDENTITY if (d / n).is_file())
-        return {
-            "source": self.id,
-            "slug": slug,
-            "sid": sid,
-            "hash": _hash_session(d),
-            "bytes": nbytes,
-            "turns": turns,
-            **S.History(slug, sid, source=self.id).status(),
-        }
+        chat_rows = jsonio.load_rows(d / "chat_history.jsonl")
+        return session_payload(
+            self.id, slug, sid,
+            hash=_hash_session(d),
+            nbytes=total_bytes(_identity_paths(d).values()),
+            turns=_summarize_from_chat(chat_rows, fold_synthetic),
+        )
 
     def perform_delete_session(self, slug: str, sid: str) -> None:
         import shutil
@@ -465,39 +398,29 @@ class _GrokBase:
         updates_path = d / "updates.jsonl"
         summary_path = d / "summary.json"
 
-        chat_rows = _load_jsonl(chat_path)
+        chat_rows = jsonio.load_rows(chat_path)
         # Which ordered prompt indices are being deleted?
         ordered_ids = _real_prompt_orders(chat_rows, fold_synthetic)
         deleted_orders = {i for i, tid in enumerate(ordered_ids) if tid in turn_ids}
-        if len(deleted_orders) != len(set(turn_ids) & set(ordered_ids)):
-            # still call delete for validation
-            pass
 
         new_chat = _delete_chat_turns(chat_rows, turn_ids, fold_synthetic)
-        updates_rows = _load_jsonl(updates_path)
+        updates_rows = jsonio.load_rows(updates_path)
         new_updates = _delete_update_turns_by_order(updates_rows, deleted_orders)
 
-        # summary patch
-        summary = {}
-        if summary_path.is_file():
-            try:
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                summary = {}
+        summary = jsonio.read_json(summary_path)
         summary["num_chat_messages"] = len(new_chat)
         summary["num_messages"] = len(new_updates)
-        summary_bytes = (json.dumps(summary, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
         paths = _identity_paths(d)
         new_data = {
             "chat_history.jsonl": _write_jsonl(new_chat, trailing=True),
             "updates.jsonl": _write_jsonl(new_updates, trailing=True),
-            "summary.json": summary_bytes,
+            "summary.json": jsonio.dump_json(summary),
         }
         # best-effort rewind_points trim
         rp = d / "rewind_points.jsonl"
         if rp.is_file() and deleted_orders:
-            rp_rows = _load_jsonl(rp)
+            rp_rows = jsonio.load_rows(rp)
             kept = []
             for raw, data in rp_rows:
                 if data and data.get("prompt_index") in deleted_orders:
@@ -509,22 +432,22 @@ class _GrokBase:
 
         S.History(slug, sid, source=self.id).record_and_write_bundle(paths, new_data)
 
-    def perform_undo(self, slug: str, sid: str, expected_hash: str) -> None:
+    def _bundle_paths(self, slug: str, sid: str, expected_hash: str) -> dict[str, Path]:
+        """Hash-guarded snapshot bundle for undo/redo."""
         d = self._sess_dir(slug, sid)
         S.check_hash_value(_hash_session(d), expected_hash, self.product_name)
         paths = _identity_paths(d)
         rp = d / "rewind_points.jsonl"
         if rp.is_file():
             paths["rewind_points.jsonl"] = rp
+        return paths
+
+    def perform_undo(self, slug: str, sid: str, expected_hash: str) -> None:
+        paths = self._bundle_paths(slug, sid, expected_hash)
         S.History(slug, sid, source=self.id).undo_bundle(paths)
 
     def perform_redo(self, slug: str, sid: str, expected_hash: str) -> None:
-        d = self._sess_dir(slug, sid)
-        S.check_hash_value(_hash_session(d), expected_hash, self.product_name)
-        paths = _identity_paths(d)
-        rp = d / "rewind_points.jsonl"
-        if rp.is_file():
-            paths["rewind_points.jsonl"] = rp
+        paths = self._bundle_paths(slug, sid, expected_hash)
         S.History(slug, sid, source=self.id).redo_bundle(paths)
 
 
