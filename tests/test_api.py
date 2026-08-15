@@ -22,7 +22,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("CHATJSONEDITOR_BACKUPS_DIR", str(tmp_path / "backups"))
     monkeypatch.setenv("CHATJSONEDITOR_CONFIG_DIR", str(tmp_path / "config"))
     from chatjsoneditor.app import app
-    return TestClient(app), proj / "sess1.jsonl"
+    return TestClient(app, base_url="http://127.0.0.1:8642"), proj / "sess1.jsonl"
 
 
 def test_unknown_source_is_400(client):

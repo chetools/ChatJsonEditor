@@ -93,6 +93,10 @@ Legacy Claude routes without `{source}` still work (`/api/projects`, `/api/sessi
 - **Grok:** delete keeps `updates.jsonl` and `chat_history.jsonl` aligned by user-prompt order; patches `summary.json` counts.
 - **Antigravity:** delete step idx ranges in SQLite + matching transcript lines; WAL lock → 409.
 - Tests never write live roots.
+- **Loopback only:** requests whose `Host` is not a loopback name are refused
+  (DNS rebinding), as are cross-origin requests (CSRF). Binding a non-loopback
+  address needs `--allow-remote`, which drops the Host check but keeps the
+  same-origin check.
 
 ## UI
 

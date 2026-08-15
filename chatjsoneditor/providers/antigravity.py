@@ -405,10 +405,7 @@ class AntigravityProvider:
         return sorted(by_slug.values(), key=lambda p: p["label"].lower())
 
     def list_sessions(self, slug: str) -> list[dict]:
-        # slugs are derived from a cwd, so they are looser than safe_name();
-        # they are only compared against generated slugs, never joined to a path
-        if ".." in slug or "/" in slug or "\\" in slug:
-            raise ValueError(f"unsafe path component: {slug!r}")
+        S.safe_name(slug)
         out = []
         for s in self._all_sessions():
             if s["slug"] != slug:
