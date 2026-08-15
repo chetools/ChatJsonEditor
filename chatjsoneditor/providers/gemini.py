@@ -6,11 +6,14 @@ Format varies across CLI versions; this adapter is intentionally tolerant.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from .. import sessions as S
 from .base import register_provider
 from .common import NormMsg, NormTurn, cap_tool, text_from_content
+
+log = logging.getLogger(__name__)
 
 
 def _root() -> Path:
@@ -48,22 +51,41 @@ def _project_label(project_hash: str) -> str:
         if p.is_file():
             try:
                 text = p.read_text(encoding="utf-8").strip()
-                if text:
-                    return text.splitlines()[0].strip()
-            except OSError:
-                pass
+            except (OSError, UnicodeDecodeError):
+                log.warning("could not read project marker %s", p, exc_info=True)
+                continue
+            if text:
+                return text.splitlines()[0].strip()
     short = project_hash[:12] + "…" if len(project_hash) > 12 else project_hash
     return f"project {short}"
+
+
+def _only_messages(path: Path, items: list) -> list[dict]:
+    """Message objects, refusing a transcript that also holds other values.
+
+    Anything dropped here would be lost the next time the file is rewritten.
+    """
+    messages = [m for m in items if isinstance(m, dict)]
+    if len(messages) != len(items):
+        raise S.CorruptDataError(
+            f"{path.name} contains {len(items) - len(messages)} entr(ies) that are "
+            "not messages; repair the file before editing this session"
+        )
+    return messages
 
 
 def _load_messages(path: Path) -> tuple[list[dict], dict]:
     """Return (messages, envelope) where envelope holds outer metadata."""
     raw = path.read_bytes()
-    text = raw.decode("utf-8")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise S.CorruptDataError(f"{path.name} is not valid UTF-8: {e}") from e
     if path.suffix.lower() == ".jsonl" or (
         not text.lstrip().startswith("{") and not text.lstrip().startswith("[")
     ):
         messages = []
+        skipped = 0
         for line in text.splitlines():
             line = line.strip()
             if not line:
@@ -71,6 +93,7 @@ def _load_messages(path: Path) -> tuple[list[dict], dict]:
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
+                skipped += 1
                 continue
             if isinstance(obj, dict):
                 # wrap line as message if it looks like one
@@ -80,21 +103,33 @@ def _load_messages(path: Path) -> tuple[list[dict], dict]:
                     messages.append(obj["message"])
                 else:
                     messages.append(obj)
+            else:
+                skipped += 1
+        if skipped:
+            # unparseable lines are dropped on rewrite, so never do it silently
+            raise S.CorruptDataError(
+                f"{path.name} has {skipped} unparseable or non-message line(s); "
+                "repair the file before editing this session"
+            )
         return messages, {"format": "jsonl"}
 
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
-        return [], {"format": "broken"}
+    except json.JSONDecodeError as e:
+        # Returning "no messages" here made a delete rewrite the file as an
+        # empty transcript, destroying a session we simply could not read.
+        raise S.CorruptDataError(f"{path.name} is not valid JSON: {e}") from e
 
     if isinstance(data, list):
-        return [m for m in data if isinstance(m, dict)], {"format": "list"}
+        return _only_messages(path, data), {"format": "list"}
     if not isinstance(data, dict):
-        return [], {"format": "unknown"}
+        raise S.CorruptDataError(
+            f"{path.name} holds a {type(data).__name__}, not a session transcript"
+        )
 
     for key in ("messages", "history", "chat", "items"):
         if isinstance(data.get(key), list):
-            return [m for m in data[key] if isinstance(m, dict)], data
+            return _only_messages(path, data[key]), data
     # single message object
     if "role" in data or "parts" in data:
         return [data], data
@@ -275,7 +310,11 @@ class GeminiProvider:
         for ph, path in _iter_session_files():
             if ph != slug:
                 continue
-            messages, _ = _load_messages(path)
+            try:
+                messages, _ = _load_messages(path)
+            except (S.CorruptDataError, OSError):
+                log.warning("listing %s without turn counts", path, exc_info=True)
+                messages = []
             turns = _group_turns(messages)
             turn_count = sum(1 for t in turns if t.deletable)
             title = path.stem
@@ -327,22 +366,14 @@ class GeminiProvider:
         path = self._session_path(slug, sid)
         S.check_hash(path, expected_hash, self.product_name)
         messages, envelope = _load_messages(path)
-        turns = _group_turns(messages, fold_synthetic)
-        by_id = {t.id: t for t in turns if t.deletable}
-        # map turn id back to message index ranges
+        # map turn id back to message index ranges, aligned with _group_turns
+        # (messages before the first user message are a non-deletable header)
         starts = [i for i, m in enumerate(messages) if _is_user_msg(m)]
         id_to_range: dict[str, tuple[int, int]] = {}
-        # rebuild ranges aligned with _group_turns
-        if starts:
-            if starts[0] > 0:
-                pass  # header non-deletable
-            for k, start in enumerate(starts):
-                end = starts[k + 1] if k + 1 < len(starts) else len(messages)
-                tid = f"g{start}"
-                mid = messages[start].get("id") or messages[start].get("messageId")
-                if mid:
-                    tid = str(mid)
-                id_to_range[tid] = (start, end)
+        for k, start in enumerate(starts):
+            end = starts[k + 1] if k + 1 < len(starts) else len(messages)
+            mid = messages[start].get("id") or messages[start].get("messageId")
+            id_to_range[str(mid) if mid else f"g{start}"] = (start, end)
         unknown = [tid for tid in turn_ids if tid not in id_to_range]
         if unknown:
             raise ValueError(f"unknown or undeletable turn ids: {unknown}")

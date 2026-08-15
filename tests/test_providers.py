@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+from chatjsoneditor import sessions as S
 
 FIX = Path(__file__).parent / "fixtures"
 
@@ -113,7 +118,6 @@ def test_grok_delete_undo_redo(multi_env):
 
 def test_grok_stale_hash(multi_env):
     g = multi_env["grok"]
-    from chatjsoneditor import sessions as S
     with pytest.raises(S.ConflictError):
         g.perform_delete("proj", "sess1", ["x"], "deadbeef")
 
@@ -159,6 +163,50 @@ def test_gemini_list_load_delete(multi_env):
     gem.perform_delete("hash123", sid, [first], payload["hash"])
     after = gem.session_payload("hash123", sid)
     assert len([t for t in after["turns"] if t["deletable"]]) == len(turns) - 1
+
+
+def test_gemini_malformed_session_refuses_to_rewrite(multi_env):
+    """A file we cannot fully parse must not be rewritten from a partial parse."""
+    gem = multi_env["gemini"]
+    sid = gem.list_sessions("hash123")[0]["sid"]
+    path = multi_env["paths"]["gemini"] / "hash123" / "chats" / "session-1.json"
+    payload = gem.session_payload("hash123", sid)
+    first = [t for t in payload["turns"] if t["deletable"]][0]["id"]
+
+    broken = path.read_text(encoding="utf-8")[:-5]
+    path.write_text(broken, encoding="utf-8")
+    with pytest.raises(S.CorruptDataError):
+        gem.session_payload("hash123", sid)
+    with pytest.raises(S.CorruptDataError):
+        gem.perform_delete("hash123", sid, [first], S.file_hash(path))
+    assert path.read_text(encoding="utf-8") == broken
+    # listing still works, just without turn counts
+    assert gem.list_sessions("hash123")[0]["turnCount"] == 0
+
+
+def test_grok_turn_ids_are_stable_across_processes(multi_env):
+    g = multi_env["grok"]
+    ids = [t["id"] for t in g.session_payload("proj", "sess1")["turns"]]
+    code = (
+        "import json;from chatjsoneditor.providers import get_provider;"
+        "print(json.dumps([t['id'] for t in "
+        "get_provider('grok').session_payload('proj','sess1')['turns']]))"
+    )
+    env = {
+        **os.environ,
+        "PYTHONHASHSEED": "12345",
+        "GROK_SESSIONS_DIR": str(multi_env["paths"]["grok"]),
+    }
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         env=env, check=True)
+    assert json.loads(out.stdout) == ids
+
+
+def test_grok_unknown_turn_id_rejected(multi_env):
+    g = multi_env["grok"]
+    payload = g.session_payload("proj", "sess1")
+    with pytest.raises(ValueError):
+        g.perform_delete("proj", "sess1", ["u0-deadbeef"], payload["hash"])
 
 
 def test_antigravity_turn_boundaries_use_step_index_not_line_index(multi_env, tmp_path):
