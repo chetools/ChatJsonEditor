@@ -21,6 +21,7 @@ def multi_env(tmp_path, monkeypatch):
     grok = tmp_path / "grok"
     gemini = tmp_path / "gemini_tmp"
     anti = tmp_path / "antigravity"
+    chatgpt = tmp_path / "chatgpt_sessions"
     backups = tmp_path / "backups"
     config = tmp_path / "config"
 
@@ -31,6 +32,7 @@ def multi_env(tmp_path, monkeypatch):
     monkeypatch.setenv("GROK_SESSIONS_DIR", str(grok))
     monkeypatch.setenv("GEMINI_TMP_DIR", str(gemini))
     monkeypatch.setenv("ANTIGRAVITY_ROOT", str(anti))
+    monkeypatch.setenv("CHATGPT_SESSIONS_DIR", str(chatgpt))
     monkeypatch.setenv("CHATJSONEDITOR_BACKUPS_DIR", str(backups))
     monkeypatch.setenv("CHATJSONEDITOR_CONFIG_DIR", str(config))
     # empty claude projects so legacy listing is empty
@@ -43,14 +45,80 @@ def multi_env(tmp_path, monkeypatch):
         "grok-build": get_provider("grok-build"),
         "gemini": get_provider("gemini"),
         "antigravity": get_provider("antigravity"),
+        "chatgpt": get_provider("chatgpt"),
         "list_sources": list_sources,
-        "paths": {"grok": grok, "gemini": gemini, "anti": anti},
+        "paths": {"grok": grok, "gemini": gemini, "anti": anti, "chatgpt": chatgpt},
     }
 
 
 def test_sources_registered(multi_env):
     ids = {s["id"] for s in multi_env["list_sources"]()}
-    assert {"claude", "grok", "grok-build", "gemini", "antigravity"} <= ids
+    assert {"claude", "chatgpt", "grok", "grok-build", "gemini", "antigravity"} <= ids
+
+
+def test_chatgpt_rollout_delete_preserves_raw_lines_and_undo_redo(multi_env):
+    """ChatGPT/Codex JSONL is range-deleted without reserializing retained rows."""
+    root = multi_env["paths"]["chatgpt"] / "2026" / "09" / "04"
+    root.mkdir(parents=True)
+    path = root / "rollout-test.jsonl"
+    rows = [
+        '{"type":"session_meta","payload":{"session_id":"s"}}',
+        '{"type":"response_item","timestamp":"2026-09-04T10:00:00Z","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":"first prompt"}]}}',
+        'this malformed raw line must survive',
+        'null',
+        '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first reply"}]}}',
+        '{"type":"response_item","payload":{"type":"function_call","call_id":"call1","name":"read_file","arguments":"{\\"path\\":\\"a\\"}"}}',
+        '{"type":"response_item","payload":{"type":"function_call_output","call_id":"call1","output":"ok"}}',
+        '{"type":"response_item","timestamp":"2026-09-04T10:01:00Z","payload":{"type":"message","id":"u2","role":"user","content":[{"type":"input_text","text":"second prompt"}]}}',
+        '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second reply"}]}}',
+    ]
+    original = "\r\n".join(rows)  # deliberately no final newline
+    path.write_bytes(original.encode("utf-8"))
+
+    provider = multi_env["chatgpt"]
+    assert provider.list_projects() == [
+        {"slug": "2026-09-04", "label": "2026-09-04", "sessionCount": 1}
+    ]
+    session = provider.list_sessions("2026-09-04")[0]
+    assert session["sid"] == "rollout-test.jsonl"
+    payload = provider.session_payload("2026-09-04", session["sid"])
+    turns = [turn for turn in payload["turns"] if turn["deletable"]]
+    assert [turn["id"] for turn in turns] == ["u1", "u2"]
+    assert "first prompt" in turns[0]["prompt"]
+    assert {message["kind"] for message in turns[0]["messages"]} >= {
+        "user", "assistant", "tool_use", "tool_result"
+    }
+
+    provider.perform_delete("2026-09-04", session["sid"], ["u2"], payload["hash"])
+    after = path.read_bytes()
+    assert after == "\r\n".join(rows[:7]).encode("utf-8")
+    assert b"this malformed raw line must survive" in after
+    assert not after.endswith(b"\n")
+    reduced = provider.session_payload("2026-09-04", session["sid"])
+    assert [turn["id"] for turn in reduced["turns"] if turn["deletable"]] == ["u1"]
+
+    provider.perform_undo("2026-09-04", session["sid"], reduced["hash"])
+    assert path.read_bytes() == original.encode("utf-8")
+    restored = provider.session_payload("2026-09-04", session["sid"])
+    provider.perform_redo("2026-09-04", session["sid"], restored["hash"])
+    assert path.read_bytes() == after
+
+
+def test_chatgpt_rejects_unknown_and_header_turn_ids(multi_env):
+    root = multi_env["paths"]["chatgpt"] / "2026" / "09" / "04"
+    root.mkdir(parents=True)
+    path = root / "rollout-test.jsonl"
+    path.write_text(
+        '{"type":"session_meta","payload":{}}\n'
+        '{"type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":"hi"}}\n',
+        encoding="utf-8",
+    )
+    provider = multi_env["chatgpt"]
+    payload = provider.session_payload("2026-09-04", path.name)
+    with pytest.raises(ValueError):
+        provider.perform_delete("2026-09-04", path.name, [S.HEADER_TURN_ID], payload["hash"])
+    with pytest.raises(ValueError):
+        provider.perform_delete("2026-09-04", path.name, ["missing"], payload["hash"])
 
 
 def test_grok_vs_build_partition(multi_env):

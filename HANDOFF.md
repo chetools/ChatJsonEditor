@@ -5,7 +5,7 @@ _Last updated: 2026-07-17_
 ## What this project is
 
 A **local web app to delete and undo deletions of earlier turns** in multi-source
-chat sessions (Claude Code, Grok, Grok Build, Gemini CLI, Antigravity). Long multi-turn
+chat sessions (Claude Code, ChatGPT/Codex, Grok, Grok Build, Gemini CLI, Antigravity). Long multi-turn
 sessions accumulate stale early turns that bloat context on resume; this tool lets you
 prune whole turns safely and reversibly, with a Claude-Desktop-like reading UI.
 
@@ -20,6 +20,7 @@ prune whole turns safely and reversibly, with a Claude-Desktop-like reading UI.
 | Source id | Label | On-disk root | Format |
 |-----------|-------|--------------|--------|
 | `claude` | Claude Code | `~/.claude/projects/<slug>/<sid>.jsonl` | JSONL + uuid/parentUuid chain |
+| `chatgpt` | ChatGPT / Codex | `~/.codex/sessions/YYYY/MM/DD/<sid>.jsonl` | Rollout JSONL, raw-line preserving |
 | `grok` | Grok | `~/.grok/sessions/<encoded-cwd>/<sid>/` | `updates.jsonl` + `chat_history.jsonl` + `summary.json` |
 | `grok-build` | Grok Build | same tree as Grok | classified by `agent_name` / `model_id` (Build wins on overlap) |
 | `gemini` | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/` | session JSON / JSONL |
@@ -29,6 +30,7 @@ Env overrides (tests use scratch copies only):
 
 ```
 CLAUDE_PROJECTS_DIR
+CHATGPT_SESSIONS_DIR
 GROK_SESSIONS_DIR / GROK_HOME
 GEMINI_TMP_DIR
 ANTIGRAVITY_ROOT

@@ -199,7 +199,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Local multi-source chat session editor "
-        "(Claude Code, Grok, Grok Build, Gemini CLI, Antigravity)"
+        "(Claude Code, ChatGPT/Codex, Grok, Grok Build, Gemini CLI, Antigravity)"
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8642)
